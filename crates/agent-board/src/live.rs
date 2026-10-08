@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use board_core::{Capability, Policy, Status};
 use board_forge::{
     Forge,
-    github::{AuthenticationRequired, Client, GitHub, Transport},
+    github::{AuthenticationRequired, Client, DiagnosticTransport, GitHub, Transport},
 };
 use clap::Args;
 use serde_json::{Value, json};
@@ -85,19 +85,63 @@ fn lifecycle(
     kept: Option<u64>,
 ) -> Result<()> {
     let (_, name) = repo.split_once('/').context("expected OWNER/REPO")?;
-    let scope = t.graphql("query($owner:String!,$repo:String!){organization(login:$owner){id} repository(owner:$owner,name:$repo){id nameWithOwner}}", json!({"owner":owner,"repo":name}))?;
+    let diagnostic = DiagnosticTransport {
+        transport: t,
+        project: kept.map_or_else(|| format!("{owner}/new"), |n| format!("{owner}/{n}")),
+        repository: repo.into(),
+    };
+    let t = &diagnostic;
+    let project_read = kept.map(|number| {
+        let result = t.graphql("query($owner:String!,$number:Int!){organization(login:$owner){projectV2(number:$number){id number}}}", json!({"owner":owner,"number":number})).and_then(|data| {
+            string(&data, "/organization/projectV2/id")
+                .with_context(|| format!("reading project {owner}/{number}"))?;
+            Ok(data)
+        });
+        eprintln!("reading project {owner}/{number}: {}", match &result { Ok(_) => "ok".into(), Err(e) => format!("refused: {e:#}") });
+        result
+    });
+    let scope = t.graphql("query($owner:String!,$repo:String!){organization(login:$owner){id} repository(owner:$owner,name:$repo){id nameWithOwner}}", json!({"owner":owner,"repo":name})).and_then(|data| {
+        string(&data, "/repository/id")
+            .with_context(|| format!("reading repository {repo}"))?;
+        ensure!(data["repository"]["nameWithOwner"].as_str() == Some(repo), "reading repository {repo}: scratch repository identity mismatch");
+        Ok(data)
+    });
+    eprintln!(
+        "reading repository {repo}: {}",
+        match &scope {
+            Ok(_) => "ok".into(),
+            Err(e) => format!("refused: {e:#}"),
+        }
+    );
+    if project_read.as_ref().is_some_and(Result::is_err) || scope.is_err() {
+        let project_report = match &project_read {
+            Some(Err(error)) => format!("{error:#}"),
+            Some(Ok(_)) => "ok".into(),
+            None => "not applicable: creating a throwaway project".into(),
+        };
+        let repository_report = match &scope {
+            Err(error) => format!("{error:#}"),
+            Ok(_) => "ok".into(),
+        };
+        let error = project_read
+            .and_then(Result::err)
+            .or_else(|| scope.err())
+            .context("missing preflight failure")?;
+        return Err(error.context(format!("live preflight failed; no writes attempted; project: {project_report}; repository: {repository_report}")));
+    }
+    let project_read = project_read.transpose()?;
+    let scope = scope?;
     ensure!(
         scope["repository"]["nameWithOwner"].as_str() == Some(repo),
         "scratch repository identity mismatch"
     );
     let organization = string(&scope, "/organization/id")?;
     let repository = string(&scope, "/repository/id")?;
-    let created = if let Some(number) = kept {
-        let data = t.graphql("query($owner:String!,$number:Int!){organization(login:$owner){projectV2(number:$number){id number}}}", json!({"owner":owner,"number":number}))?;
+    let created = if let Some(data) = project_read {
         json!({"createProjectV2":{"projectV2":data["organization"]["projectV2"]}})
     } else {
         t.graphql("mutation($owner:ID!,$title:String!){createProjectV2(input:{ownerId:$owner,title:$title}){projectV2{id number}}}", json!({"owner":organization,"title":title}))
-        .context("create staging project: the token needs Organization Projects read/write permission; fine-grained token support must be verified live")?
+        ?
     };
     let project_id = string(&created, "/createProjectV2/projectV2/id")?;
     eprintln!(
@@ -487,6 +531,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn preflight_attempts_both_reads_without_writes() {
+        struct Refused(RefCell<Vec<String>>);
+
+        impl Transport for Refused {
+            fn graphql(&self, query: &str, _: Value) -> Result<Value> {
+                self.0.borrow_mut().push(query.into());
+                bail!("GitHub GraphQL: FORBIDDEN: recorded refusal")
+            }
+        }
+
+        let transport = Refused(RefCell::new(vec![]));
+        let error = lifecycle(
+            &transport,
+            "cgwalters-forge-stage",
+            "cgwalters-forge-stage/board-test",
+            "nonce",
+            Some(2),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("reading project cgwalters-forge-stage/2"));
+        let calls = transport.0.borrow();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].contains("projectV2(number"));
+        assert!(calls[1].contains("repository(owner:"));
+        assert!(calls.iter().all(|query| query.starts_with("query")));
     }
 
     #[test]
