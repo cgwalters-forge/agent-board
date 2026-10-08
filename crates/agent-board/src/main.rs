@@ -324,7 +324,12 @@ fn execute(cli: Cli) -> Result<()> {
             command: Test::Project(options),
         } => {
             ensure!(cli.snapshot.is_none(), "live fixture cannot use --snapshot");
-            live::run(options, cli.owner.as_deref(), cli.repo.as_deref())
+            live::run(
+                options,
+                cli.owner.as_deref(),
+                cli.repo.as_deref(),
+                cli.project,
+            )
         }
         _ => bail!("unsupported_capability: command not implemented in step 1"),
     }

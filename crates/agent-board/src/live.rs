@@ -11,9 +11,13 @@ use serde_json::{Value, json};
 const DELETE: &str =
     "mutation($id:ID!){deleteProjectV2(input:{projectId:$id}){deletedProjectV2Id}}";
 const CLOSE: &str = "mutation($id:ID!){closeIssue(input:{issueId:$id}){issue{id state}}}";
+const REMOVE: &str = "mutation($project:ID!,$item:ID!){deleteProjectV2Item(input:{projectId:$project,itemId:$item}){deletedItemId}}";
 
 #[derive(Args)]
 pub struct Options {
+    /// Create and delete a throwaway project instead of using --project.
+    #[arg(long, conflicts_with = "project")]
+    create_project: bool,
     /// Sweeping remains disabled: names and descriptions cannot authorize deletion.
     #[arg(long)]
     sweep: bool,
@@ -27,13 +31,26 @@ pub fn error_exit_code(error: &anyhow::Error) -> i32 {
     }
 }
 
-pub fn run(options: &Options, owner: Option<&str>, repo: Option<&str>) -> Result<()> {
+pub fn run(
+    options: &Options,
+    owner: Option<&str>,
+    repo: Option<&str>,
+    project: Option<u64>,
+) -> Result<()> {
     ensure!(
         !options.sweep,
         "unsupported_capability: sweeping requires independently trusted creation receipts; use manual recovery"
     );
     let owner = owner.context("test project requires --owner")?;
     let repo = repo.context("test project requires --repo OWNER/REPO")?;
+    ensure!(
+        options.create_project || project.is_some(),
+        "test project requires --project NUMBER or --create-project"
+    );
+    ensure!(
+        project.is_none_or(|n| n > 0),
+        "project number must be positive"
+    );
     ensure!(
         owner == "cgwalters-forge-stage",
         "live fixture owner must be cgwalters-forge-stage"
@@ -49,7 +66,7 @@ pub fn run(options: &Options, owner: Option<&str>, repo: Option<&str>) -> Result
         "agent-board-ci-{}",
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     );
-    lifecycle(&Client::from_env()?, owner, repo, &title)
+    lifecycle(&Client::from_env()?, owner, repo, &title, project)
 }
 
 fn string(value: &Value, pointer: &str) -> Result<String> {
@@ -60,7 +77,13 @@ fn string(value: &Value, pointer: &str) -> Result<String> {
         .with_context(|| format!("missing fixture response {pointer}; mutation may be ambiguous"))
 }
 
-fn lifecycle(t: &impl Transport, owner: &str, repo: &str, title: &str) -> Result<()> {
+fn lifecycle(
+    t: &impl Transport,
+    owner: &str,
+    repo: &str,
+    title: &str,
+    kept: Option<u64>,
+) -> Result<()> {
     let (_, name) = repo.split_once('/').context("expected OWNER/REPO")?;
     let scope = t.graphql("query($owner:String!,$repo:String!){organization(login:$owner){id} repository(owner:$owner,name:$repo){id nameWithOwner}}", json!({"owner":owner,"repo":name}))?;
     ensure!(
@@ -69,15 +92,28 @@ fn lifecycle(t: &impl Transport, owner: &str, repo: &str, title: &str) -> Result
     );
     let organization = string(&scope, "/organization/id")?;
     let repository = string(&scope, "/repository/id")?;
-    let created = t.graphql("mutation($owner:ID!,$title:String!){createProjectV2(input:{ownerId:$owner,title:$title}){projectV2{id number}}}", json!({"owner":organization,"title":title}))
-        .context("create staging project: the token needs Organization Projects read/write permission; fine-grained token support must be verified live")?;
+    let created = if let Some(number) = kept {
+        let data = t.graphql("query($owner:String!,$number:Int!){organization(login:$owner){projectV2(number:$number){id number}}}", json!({"owner":owner,"number":number}))?;
+        json!({"createProjectV2":{"projectV2":data["organization"]["projectV2"]}})
+    } else {
+        t.graphql("mutation($owner:ID!,$title:String!){createProjectV2(input:{ownerId:$owner,title:$title}){projectV2{id number}}}", json!({"owner":organization,"title":title}))
+        .context("create staging project: the token needs Organization Projects read/write permission; fine-grained token support must be verified live")?
+    };
     let project_id = string(&created, "/createProjectV2/projectV2/id")?;
-    eprintln!("Created fixture project {project_id}; cleanup uses only this in-memory ID.");
+    eprintln!(
+        "Fixture project {project_id}; throwaway: {}.",
+        kept.is_none()
+    );
     let mut issue_id = None;
+    let mut item_id = None;
     let result = (|| -> Result<()> {
         let number = created["createProjectV2"]["projectV2"]["number"]
             .as_u64()
             .context("missing created project number")?;
+        ensure!(
+            kept.is_none_or(|expected| number == expected),
+            "kept project number mismatch"
+        );
         let issue = t.graphql("mutation($repo:ID!,$title:String!){createIssue(input:{repositoryId:$repo,title:$title,body:\"Disposable agent-board live fixture\"}){issue{id number}}}", json!({"repo":repository,"title":title}))?;
         issue_id = Some(string(&issue, "/createIssue/issue/id")?);
         eprintln!(
@@ -88,10 +124,61 @@ fn lifecycle(t: &impl Transport, owner: &str, repo: &str, title: &str) -> Result
             .as_u64()
             .context("missing created issue number")?;
         let added = t.graphql("mutation($project:ID!,$issue:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$issue}){item{id}}}", json!({"project":project_id,"issue":issue_id}))?;
-        let item_id = string(&added, "/addProjectV2ItemById/item/id")?;
-        let field = t.graphql("mutation($project:ID!){createProjectV2Field(input:{projectId:$project,dataType:TEXT,name:\"Fixture nonce\"}){projectV2Field{... on ProjectV2Field{id}}}}", json!({"project":project_id}))?;
-        let field_id = string(&field, "/createProjectV2Field/projectV2Field/id")?;
-        t.graphql("mutation($project:ID!,$item:ID!,$field:ID!,$text:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{text:$text}}){projectV2Item{id}}}", json!({"project":project_id,"item":item_id,"field":field_id,"text":title}))?;
+        item_id = Some(string(&added, "/addProjectV2ItemById/item/id")?);
+        let (field_id, field_name, option) = if kept.is_some() {
+            let mut cursor = Value::Null;
+            let mut cursors = std::collections::BTreeSet::new();
+            loop {
+                let fields = t.graphql("query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{fields(first:100,after:$cursor){nodes{... on ProjectV2SingleSelectField{id name dataType options{id name}}} pageInfo{hasNextPage endCursor}}}}}", json!({"id":project_id,"cursor":cursor}))?;
+                let connection = &fields["node"]["fields"];
+                let nodes = connection["nodes"]
+                    .as_array()
+                    .context("missing fixture field schema")?;
+                if let Some(field) = nodes
+                    .iter()
+                    .find(|f| f["name"] == "Status" && f["dataType"] == "SINGLE_SELECT")
+                {
+                    let done = field["options"]
+                        .as_array()
+                        .and_then(|opts| opts.iter().find(|o| o["name"] == "Done"))
+                        .context("kept project Status needs a Done option")?;
+                    break (
+                        string(field, "/id")?,
+                        "Status".into(),
+                        Some(string(done, "/id")?),
+                    );
+                }
+                ensure!(
+                    connection["pageInfo"]["hasNextPage"] == true,
+                    "kept project needs an existing Status single-select field"
+                );
+                cursor = connection["pageInfo"]["endCursor"].clone();
+                ensure!(
+                    cursor.is_string()
+                        && cursors.insert(cursor.to_string())
+                        && cursors.len() < 1000,
+                    "invalid fixture field pagination"
+                );
+            }
+        } else {
+            let field = t.graphql("mutation($project:ID!){createProjectV2Field(input:{projectId:$project,dataType:TEXT,name:\"Fixture nonce\"}){projectV2Field{... on ProjectV2Field{id}}}}", json!({"project":project_id}))?;
+            (
+                string(&field, "/createProjectV2Field/projectV2Field/id")?,
+                "Fixture nonce".to_owned(),
+                None,
+            )
+        };
+        let value = if let Some(option) = &option {
+            json!({"singleSelectOptionId":option})
+        } else {
+            json!({"text":title})
+        };
+        let updated = t.graphql("mutation($project:ID!,$item:ID!,$field:ID!,$value:ProjectV2FieldValue!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:$value}){projectV2Item{id}}}", json!({"project":project_id,"item":item_id,"field":field_id,"value":value}))?;
+        ensure!(
+            updated["updateProjectV2ItemFieldValue"]["projectV2Item"]["id"].as_str()
+                == item_id.as_deref(),
+            "field update receipt mismatch"
+        );
         struct Borrowed<'a, T>(&'a T);
         impl<T: Transport> Transport for Borrowed<'_, T> {
             fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
@@ -105,10 +192,24 @@ fn lifecycle(t: &impl Transport, owner: &str, repo: &str, title: &str) -> Result
         }
         .snapshot()?;
         ensure!(
-            snapshot.coverage.complete && snapshot.items.len() == 1,
+            snapshot.coverage.complete,
             "live snapshot did not return complete fixture membership"
         );
-        let item = &snapshot.items[0];
+        ensure!(
+            snapshot.project.as_str()
+                == format!("https://github.com/orgs/{owner}/projects/{number}"),
+            "live project readback mismatch"
+        );
+        let matches: Vec<_> = snapshot
+            .items
+            .iter()
+            .filter(|item| item.identity.repository == repo && item.identity.number == issue_number)
+            .collect();
+        ensure!(
+            matches.len() == 1,
+            "live snapshot must contain exactly one scratch issue"
+        );
+        let item = matches[0];
         ensure!(
             item.identity.repository == repo
                 && item.identity.number == issue_number
@@ -119,17 +220,25 @@ fn lifecycle(t: &impl Transport, owner: &str, repo: &str, title: &str) -> Result
             "live issue readback mismatch"
         );
         ensure!(
-            item.fields
-                .get("Fixture nonce")
-                .and_then(|v| v["text"].as_str())
-                == Some(title),
+            if let Some(option) = &option {
+                item.status == Some(Status::Done)
+                    && item
+                        .fields
+                        .get(&field_name)
+                        .is_some_and(|v| v["optionId"].as_str() == Some(option))
+            } else {
+                item.fields
+                    .get(&field_name)
+                    .and_then(|v| v["text"].as_str())
+                    == Some(title)
+            },
             "live field readback mismatch"
         );
         ensure!(
             snapshot
                 .fields
                 .iter()
-                .any(|f| f["name"].as_str() == Some("Fixture nonce")),
+                .any(|f| f["id"].as_str() == Some(&field_id)),
             "live schema readback mismatch"
         );
         ensure!(
@@ -145,21 +254,45 @@ fn lifecycle(t: &impl Transport, owner: &str, repo: &str, title: &str) -> Result
             capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
         };
         let plan = board_core::reconcile(&snapshot, &policy, &snapshot.clock)?;
+        let actions: Vec<_> = plan
+            .actions
+            .iter()
+            .filter(|action| match &action.intent {
+                board_core::Intent::SetStatus { item: target, .. }
+                | board_core::Intent::CloseIssue { item: target, .. } => target == &item.identity,
+            })
+            .collect();
         ensure!(
-            plan.actions.len() == 1
-                && matches!(
-                    plan.actions[0].intent,
-                    board_core::Intent::SetStatus {
-                        value: Status::Triage,
-                        ..
-                    }
-                ),
+            actions.len() == 1
+                && if kept.is_some() {
+                    matches!(actions[0].intent, board_core::Intent::CloseIssue { .. })
+                } else {
+                    matches!(
+                        actions[0].intent,
+                        board_core::Intent::SetStatus {
+                            value: Status::Triage,
+                            ..
+                        }
+                    )
+                },
             "live reconcile plan mismatch"
         );
         Ok(())
     })();
-    // Attempt both cleanups even if either fails. Never read a project name or marker
-    // to decide what can be deleted; the ID comes only from this create response.
+    // Attempt every cleanup even if another fails. Only returned creation IDs
+    // authorize item removal and issue closure; never act on a title or marker.
+    let remove = if let Some(id) = &item_id {
+        t.graphql(REMOVE, json!({"project":project_id,"item":id}))
+            .and_then(|v| {
+                ensure!(
+                    v["deleteProjectV2Item"]["deletedItemId"].as_str() == Some(id),
+                    "item cleanup receipt mismatch"
+                );
+                Ok(())
+            })
+    } else {
+        Ok(())
+    };
     let close = if let Some(id) = &issue_id {
         t.graphql(CLOSE, json!({"id":id})).and_then(|v| {
             ensure!(
@@ -172,17 +305,22 @@ fn lifecycle(t: &impl Transport, owner: &str, repo: &str, title: &str) -> Result
     } else {
         Ok(())
     };
-    let delete = t.graphql(DELETE, json!({"id":project_id})).and_then(|v| {
-        ensure!(
-            v["deleteProjectV2"]["deletedProjectV2Id"].as_str() == Some(&project_id),
-            "project cleanup receipt mismatch"
-        );
+    let delete = if kept.is_none() {
+        t.graphql(DELETE, json!({"id":project_id})).and_then(|v| {
+            ensure!(
+                v["deleteProjectV2"]["deletedProjectV2Id"].as_str() == Some(&project_id),
+                "project cleanup receipt mismatch"
+            );
+            Ok(())
+        })
+    } else {
         Ok(())
-    });
-    if close.is_err() || delete.is_err() {
+    };
+    if close.is_err() || delete.is_err() || remove.is_err() {
         bail!(
-            "fixture cleanup failed; manual recovery: project {project_id}, issue {}; issue cleanup: {}; project cleanup: {}; fixture: {}",
+            "fixture cleanup failed; manual recovery: project {project_id}, issue {}, item {}; issue cleanup: {}; project cleanup: {}; fixture: {}; item cleanup: {}",
             issue_id.as_deref().unwrap_or("not created or ambiguous"),
+            item_id.as_deref().unwrap_or("not created or ambiguous"),
             close
                 .err()
                 .map(|e| format!("{e:#}"))
@@ -192,6 +330,10 @@ fn lifecycle(t: &impl Transport, owner: &str, repo: &str, title: &str) -> Result
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_else(|| "ok".into()),
             result
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "ok".into()),
+            remove
                 .err()
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_else(|| "ok".into())
@@ -219,7 +361,7 @@ mod tests {
             let mut calls = self.calls.borrow_mut();
             calls.push(query.into());
             if calls.len() == self.fail {
-                bail!("recorded failure");
+                bail!("GitHub GraphQL: FORBIDDEN: recorded refusal");
             }
             if query == DELETE {
                 assert_eq!(variables["id"], "P_created");
@@ -228,6 +370,15 @@ mod tests {
             if query == CLOSE {
                 assert_eq!(variables["id"], "I_created");
                 return Ok(json!({"closeIssue":{"issue":{"id":"I_created","state":"CLOSED"}}}));
+            }
+            if query == REMOVE {
+                assert_eq!(variables["project"], "P_created");
+                assert_eq!(variables["item"], "M_created");
+                return Ok(json!({"deleteProjectV2Item":{"deletedItemId":"M_created"}}));
+            }
+            if query.contains("projectV2(number") && query.contains("organization(login") {
+                assert_eq!(variables["number"], 2);
+                return Ok(json!({"organization":{"projectV2":{"id":"P_created","number":2}}}));
             }
             if query.contains("organization(login") {
                 return Ok(
@@ -241,25 +392,32 @@ mod tests {
                 return Ok(json!({"createIssue":{"issue":{"id":"I_created","number":1}}}));
             }
             if query.contains("addProjectV2ItemById(") {
+                assert_eq!(variables["project"], "P_created");
+                assert_eq!(variables["issue"], "I_created");
                 return Ok(json!({"addProjectV2ItemById":{"item":{"id":"M_created"}}}));
             }
             if query.contains("createProjectV2Field(") {
                 return Ok(json!({"createProjectV2Field":{"projectV2Field":{"id":"F_created"}}}));
             }
             if query.contains("updateProjectV2ItemFieldValue(") {
+                assert_eq!(variables["project"], "P_created");
+                assert_eq!(variables["item"], "M_created");
                 return Ok(
                     json!({"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"M_created"}}}),
                 );
             }
             if query.contains("repositoryOwner(") {
                 return Ok(
-                    json!({"repositoryOwner":{"projectV2":{"id":"P_created","url":"https://github.com/orgs/cgwalters-forge-stage/projects/1"}}}),
+                    json!({"repositoryOwner":{"projectV2":{"id":"P_created","url":format!("https://github.com/orgs/cgwalters-forge-stage/projects/{}", variables["number"])}}}),
                 );
             }
+            let kept = calls
+                .iter()
+                .any(|q| q.contains("projectV2(number") && q.contains("organization(login"));
             let (key, nodes) = if query.contains("fields(first") {
                 (
                     "fields",
-                    json!([{"id":"F_created","name":"Fixture nonce","dataType":"TEXT"},{"id":"F_status","name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"todo","name":"Todo"}]}]),
+                    json!([{"id":"F_created","name":"Fixture nonce","dataType":"TEXT"},{"id":"F_status","name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"todo","name":"Todo"},{"id":"done","name":"Done"}]}]),
                 )
             } else if query.contains("items(first") {
                 (
@@ -269,7 +427,11 @@ mod tests {
             } else if query.contains("fieldValues(first") {
                 (
                     "fieldValues",
-                    json!([{"__typename":"ProjectV2ItemFieldTextValue","text":"nonce","field":{"name":"Fixture nonce"}}]),
+                    if kept {
+                        json!([{"__typename":"ProjectV2ItemFieldSingleSelectValue","name":"Done","optionId":"done","field":{"name":"Status"}}])
+                    } else {
+                        json!([{"__typename":"ProjectV2ItemFieldTextValue","text":"nonce","field":{"name":"Fixture nonce"}}])
+                    },
                 )
             } else if query.contains("labels(first") {
                 ("labels", json!([]))
@@ -284,25 +446,94 @@ mod tests {
 
     #[test]
     fn lifecycle_failure_table() {
-        for fail in 0..=15 {
-            let t = Recorded {
-                calls: RefCell::new(vec![]),
-                fail,
+        for kept in [None, Some(2)] {
+            for fail in 0..=15 {
+                let t = Recorded {
+                    calls: RefCell::new(vec![]),
+                    fail,
+                };
+                let result = lifecycle(
+                    &t,
+                    "cgwalters-forge-stage",
+                    "cgwalters-forge-stage/board-test",
+                    "nonce",
+                    kept,
+                );
+                let total = if kept.is_some() { 14 } else { 15 };
+                assert_eq!(
+                    result.is_ok(),
+                    fail == 0 || fail > total,
+                    "failure at {fail}, kept {kept:?}: {result:?}"
+                );
+                let calls = t.calls.borrow();
+                assert_eq!(
+                    calls.iter().any(|q| q == DELETE),
+                    kept.is_none() && fail != 1 && fail != 2
+                );
+                assert_eq!(
+                    calls.iter().any(|q| q.contains("createProjectV2(")),
+                    kept.is_none() && fail != 1
+                );
+                assert!(
+                    !calls
+                        .iter()
+                        .any(|q| kept.is_some() && q.contains("createProjectV2Field("))
+                );
+                if fail == 0 || fail >= 4 {
+                    assert!(calls.iter().any(|q| q == CLOSE));
+                }
+                if fail == 0 || fail >= 5 {
+                    assert!(calls.iter().any(|q| q == REMOVE));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kept_project_with_other_items_and_readback_mismatches() {
+        struct Readback {
+            recorded: Recorded,
+            corrupt: bool,
+        }
+
+        impl Transport for Readback {
+            fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+                let mut response = self.recorded.graphql(query, variables)?;
+                if query.contains("items(first") {
+                    let nodes = response["node"]["items"]["nodes"].as_array_mut().unwrap();
+                    let mut other = nodes[0].clone();
+                    other["id"] = "M_unrelated".into();
+                    other["content"]["id"] = "I_unrelated".into();
+                    other["content"]["number"] = 99.into();
+                    nodes.push(other);
+                    if self.corrupt {
+                        nodes[0]["content"]["title"] = "wrong".into();
+                    }
+                }
+                Ok(response)
+            }
+        }
+
+        for corrupt in [false, true] {
+            let transport = Readback {
+                recorded: Recorded {
+                    calls: RefCell::new(vec![]),
+                    fail: 0,
+                },
+                corrupt,
             };
             let result = lifecycle(
-                &t,
+                &transport,
                 "cgwalters-forge-stage",
                 "cgwalters-forge-stage/board-test",
                 "nonce",
+                Some(2),
             );
-            assert_eq!(result.is_ok(), fail == 0 || fail > 14, "failure at {fail}");
-            let calls = t.calls.borrow();
-            if fail != 1 && fail != 2 {
-                assert!(calls.iter().any(|q| q == DELETE));
-            }
-            if fail == 0 || fail >= 4 {
-                assert!(calls.iter().any(|q| q == CLOSE));
-            }
+            assert_eq!(result.is_ok(), !corrupt, "{result:?}");
+            let calls = transport.recorded.calls.borrow();
+            assert!(calls.iter().any(|q| q == REMOVE));
+            assert!(calls.iter().any(|q| q == CLOSE));
+            assert!(!calls.iter().any(|q| q == DELETE));
         }
     }
 }

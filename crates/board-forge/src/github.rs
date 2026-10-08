@@ -141,6 +141,7 @@ impl Client {
         Ok(Self {
             token,
             agent: ureq::Agent::config_builder()
+                .http_status_as_error(false)
                 .timeout_global(Some(std::time::Duration::from_secs(30)))
                 .build()
                 .into(),
@@ -166,18 +167,35 @@ fn transport_error(error: ureq::Error) -> anyhow::Error {
 }
 
 fn response_data(response: Value) -> Result<Value> {
+    let details = response["errors"]
+        .as_array()
+        .map(|errors| {
+            errors
+                .iter()
+                .map(|error| {
+                    format!(
+                        "{}: {}",
+                        error["type"].as_str().unwrap_or("UNKNOWN"),
+                        error["message"].as_str().unwrap_or("message unavailable")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
     if response["errors"].as_array().is_some_and(|errors| {
         errors
             .iter()
             .any(|e| e["type"] == "UNAUTHORIZED" || e["extensions"]["code"] == "UNAUTHENTICATED")
     }) {
-        return Err(AuthenticationRequired.into());
+        return Err(anyhow::Error::from(AuthenticationRequired)
+            .context(format!("GitHub GraphQL: {details}")));
     }
     ensure!(
         response
             .get("errors")
             .is_none_or(|e| e.is_null() || e.as_array().is_some_and(Vec::is_empty)),
-        "GitHub GraphQL denied or failed the operation: check Organization Projects permission and repository Issues permission; response may be partial"
+        "GitHub GraphQL: {details}; response may be partial"
     );
     response
         .get("data")
@@ -188,18 +206,36 @@ fn response_data(response: Value) -> Result<Value> {
 
 impl Transport for Client {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        let response: Value = self
+        let mut response = self
             .agent
             .post("https://api.github.com/graphql")
             .header("Authorization", &format!("Bearer {}", self.token))
             .header("User-Agent", "agent-board")
             .send_json(json!({"query":query,"variables":variables}))
-            .map_err(transport_error)?
-            .body_mut()
-            .read_json()
-            .context("decode GitHub GraphQL response")?;
-        response_data(response)
+            .map_err(transport_error)?;
+        let status = response.status().as_u16();
+        let body: Value = match response.body_mut().read_json() {
+            Ok(body) => body,
+            Err(_) if !(200..300).contains(&status) => json!({}),
+            Err(error) => return Err(error).context("decode GitHub GraphQL response"),
+        };
+        http_response_data(status, body)
     }
+}
+
+fn http_response_data(status: u16, body: Value) -> Result<Value> {
+    if !(200..300).contains(&status) {
+        let message = body["message"].as_str().unwrap_or("message unavailable");
+        let diagnostic = format!("GitHub HTTP status {status}: {message}");
+        if body["errors"].as_array().is_some_and(|e| !e.is_empty()) {
+            return response_data(body).with_context(|| diagnostic);
+        }
+        if status == 401 {
+            return Err(anyhow::Error::from(AuthenticationRequired).context(diagnostic));
+        }
+        anyhow::bail!("{diagnostic}");
+    }
+    response_data(body)
 }
 
 pub struct GitHub<T> {
@@ -568,9 +604,30 @@ mod tests {
                 false,
             ),
         ] {
+            let has_message = response["errors"][0]["message"].is_string();
             let error = response_data(response).unwrap_err();
             assert_eq!(error.is::<AuthenticationRequired>(), authentication);
-            assert!(!error.to_string().contains("not echoed"));
+            assert_eq!(error.to_string().contains("not echoed"), has_message);
+        }
+    }
+
+    #[test]
+    fn refusal_diagnostics() {
+        let error = response_data(json!({"errors":[{"type":"FORBIDDEN","message":"Projects denied","path":["hidden"]},{"type":"NOT_FOUND","message":"Missing project"}],"data":{"hidden":"body"}})).unwrap_err().to_string();
+        assert!(error.contains("FORBIDDEN: Projects denied"));
+        assert!(error.contains("NOT_FOUND: Missing project"));
+        assert!(!error.contains("hidden"));
+        for status in [401, 403, 429, 500] {
+            let error =
+                http_response_data(status, json!({"message":"Access refused","other":"hidden"}))
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{status}: Access refused"))
+            );
+            assert!(!error.to_string().contains("hidden"));
+            assert_eq!(error.is::<AuthenticationRequired>(), status == 401);
         }
     }
 
