@@ -207,11 +207,21 @@ Offline fixtures cover pagination, redacted/null nodes, permissions, rate limits
 
 ### Current implementation limits
 
-The workspace currently implements offline snapshots, the single missing-status
-rule, preview-only GitHub proposal lowering, and immediate staging fixture
-create/read/delete. It does not complete step 1's protected workflow, scheduled
+The workspace currently implements offline snapshots, missing-status and
+issue/status terminal-drift rules, preview-only GitHub proposal lowering, and
+immediate staging fixture create/read/delete. It does not complete step 1's protected workflow, scheduled
 sweeper or pinned agentic-job caller requirements. No live execution or pinned
 external handler/bounds contract has been verified here.
+
+Terminal-drift plans propose closing an open issue marked Done, or setting Done
+on a closed issue (including one with no status). They do not authorize closure:
+the independent checker/applier must verify that the target is an issue and
+that authenticated completion evidence exists, as required in section 4. Both
+the observed status and issue state are captured as preconditions. Incomplete
+snapshot coverage blocks all repairs; incomplete item fields block that item's
+repairs. Closed issues are classified before the missing-status rule, avoiding
+an intermediate Triage proposal. No live reads or live terminal repair have
+been verified.
 
 `test project --sweep` fails before authentication or network access. Editable
 project descriptions and completed Actions runs cannot prove who created a

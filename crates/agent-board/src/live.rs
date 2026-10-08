@@ -31,7 +31,7 @@ impl std::fmt::Display for AuthenticationRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "authentication required: provide a valid GH_TOKEN in the protected live environment"
+            "authentication required: provide a valid GH_TOKEN or GITHUB_TOKEN in the protected live environment"
         )
     }
 }
@@ -65,6 +65,9 @@ trait Transport {
 fn classify_transport_error(error: ureq::Error) -> anyhow::Error {
     match error {
         ureq::Error::StatusCode(401) => AuthenticationRequired.into(),
+        ureq::Error::StatusCode(403) => anyhow::anyhow!(
+            "GitHub denied the request (HTTP 403): check Organization Projects read/write and repository Issues read/write permissions on the staging token, organization approval, and rate limits"
+        ),
         // Do not include server bodies, request headers or arbitrary transport text.
         ureq::Error::StatusCode(status) => {
             anyhow::anyhow!("GitHub HTTP request failed (status {status})")
@@ -135,10 +138,10 @@ pub fn run(options: &Options) -> Result<()> {
     if options.sweep {
         return sweep();
     }
-    let token = std::env::var("GH_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
-        .ok_or(AuthenticationRequired)?;
+    let token = select_token(
+        std::env::var("GH_TOKEN").ok(),
+        std::env::var("GITHUB_TOKEN").ok(),
+    )?;
     let mut transport = GitHub {
         token,
         agent: ureq::Agent::config_builder()
@@ -169,6 +172,13 @@ pub fn run(options: &Options) -> Result<()> {
         created: now,
     };
     lifecycle(&mut transport, options, &receipt)
+}
+
+fn select_token(gh_token: Option<String>, github_token: Option<String>) -> Result<String> {
+    gh_token
+        .filter(|token| !token.is_empty())
+        .or_else(|| github_token.filter(|token| !token.is_empty()))
+        .ok_or_else(|| AuthenticationRequired.into())
 }
 
 fn title(receipt: &Receipt) -> String {
@@ -421,6 +431,24 @@ mod tests {
             );
             assert_eq!(error_exit_code(&error), if authentication { 4 } else { 1 });
             assert!(!format!("{error:#}").contains("response body"));
+        }
+    }
+
+    #[test]
+    fn token_precedence_table() {
+        for (gh, github, expected) in [
+            (Some("primary"), Some("fallback"), Some("primary")),
+            (Some(""), Some("fallback"), Some("fallback")),
+            (None, Some("fallback"), Some("fallback")),
+            (Some("primary"), None, Some("primary")),
+            (Some(""), Some(""), None),
+            (None, None, None),
+        ] {
+            let result = select_token(gh.map(str::to_owned), github.map(str::to_owned));
+            match expected {
+                Some(value) => assert_eq!(result.unwrap(), value),
+                None => assert_eq!(error_exit_code(&result.unwrap_err()), 4),
+            }
         }
     }
 }

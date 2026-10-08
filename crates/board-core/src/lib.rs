@@ -71,6 +71,7 @@ pub struct Actor {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BoardField {
+    IssueState,
     Status,
     Priority,
     Turn,
@@ -234,7 +235,15 @@ pub struct Precondition {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Intent {
-    SetStatus { item: ItemRef, value: Status },
+    SetStatus {
+        item: ItemRef,
+        value: Status,
+    },
+    /// A preview of drift, not proof of accepted completion. An independent
+    /// applier must verify issue type and authenticated completion evidence.
+    CloseIssue {
+        item: ItemRef,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -275,6 +284,13 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
     if !policy.capabilities.contains(&Capability::ProjectFieldEdit) {
         bail!("unsupported_capability: project field edits");
     }
+    if !snapshot.coverage.complete {
+        plan.diagnostics.insert(
+            "coverage".into(),
+            "missing_data: incomplete snapshot; no repairs proposed".into(),
+        );
+        return Ok(plan);
+    }
     for item in &snapshot.items {
         if !item.fields_complete {
             plan.diagnostics.insert(
@@ -283,27 +299,67 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
             );
             continue;
         }
-        if item.status.is_some() || !policy.repositories.contains(&item.identity.repository) {
+        if !policy.repositories.contains(&item.identity.repository) {
             continue;
         }
         ensure!(
             Some(item.identity.host.as_str()) == snapshot.project.host_str(),
             "item host differs from project host"
         );
-        let key_input =
-            serde_json::to_vec(&(snapshot.project.as_str(), &item.identity, "missing_status"))?;
+        let (reason, intent) = match (&item.status, item.state.as_str()) {
+            (Some(Status::Done), "open") => {
+                if !policy.capabilities.contains(&Capability::CloseIssue) {
+                    plan.diagnostics.insert(
+                        item.identity.display(),
+                        "unsupported_capability: closing issues".into(),
+                    );
+                    continue;
+                }
+                (
+                    "done_issue_open",
+                    Intent::CloseIssue {
+                        item: item.identity.clone(),
+                    },
+                )
+            }
+            (status, "closed") if *status != Some(Status::Done) => (
+                "closed_issue_not_done",
+                Intent::SetStatus {
+                    item: item.identity.clone(),
+                    value: Status::Done,
+                },
+            ),
+            (None, "open") => (
+                "missing_status",
+                Intent::SetStatus {
+                    item: item.identity.clone(),
+                    value: Status::Triage,
+                },
+            ),
+            _ => continue,
+        };
+        let key_input = serde_json::to_vec(&(snapshot.project.as_str(), &item.identity, reason))?;
         plan.actions.push(Action {
             key: format!("{:x}", Sha256::digest(key_input)),
-            reason: "missing_status".into(),
-            intent: Intent::SetStatus {
-                item: item.identity.clone(),
-                value: Status::Triage,
-            },
-            prerequisites: vec![Precondition {
-                item: item.identity.clone(),
-                field: BoardField::Status,
-                expected: None,
-            }],
+            reason: reason.into(),
+            intent,
+            prerequisites: vec![
+                Precondition {
+                    item: item.identity.clone(),
+                    field: BoardField::Status,
+                    expected: item
+                        .status
+                        .as_ref()
+                        .map(serde_json::to_value)
+                        .transpose()?
+                        .and_then(|value| value.as_str().map(str::to_owned)),
+                },
+                Precondition {
+                    item: item.identity.clone(),
+                    field: BoardField::IssueState,
+                    expected: Some(item.state.clone()),
+                },
+            ],
             evidence: item.evidence.clone(),
         });
     }
@@ -314,6 +370,102 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_drift_table() {
+        let statuses = [
+            None,
+            Some(Status::Triage),
+            Some(Status::Backlog),
+            Some(Status::Todo),
+            Some(Status::InProgress),
+            Some(Status::Draft),
+            Some(Status::InReview),
+            Some(Status::Blocked),
+            Some(Status::Done),
+            Some(Status::Cancelled),
+        ];
+        for status in statuses {
+            for state in ["open", "closed"] {
+                let mut snapshot: Snapshot =
+                    serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+                snapshot.items.truncate(1);
+                snapshot.items[0].status = status.clone();
+                snapshot.items[0].state = state.into();
+                let policy = Policy {
+                    project: snapshot.project.clone(),
+                    repositories: vec!["example/intake".into()],
+                    capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
+                };
+                let expected = match (&status, state) {
+                    (Some(Status::Done), "open") => Some("done_issue_open"),
+                    (status, "closed") if *status != Some(Status::Done) => {
+                        Some("closed_issue_not_done")
+                    }
+                    (None, "open") => Some("missing_status"),
+                    _ => None,
+                };
+                let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
+                assert_eq!(plan.actions.len(), usize::from(expected.is_some()));
+                if let Some(reason) = expected {
+                    let action = &plan.actions[0];
+                    assert_eq!(action.reason, reason);
+                    assert_eq!(action.prerequisites.len(), 2);
+                    assert_eq!(action.prerequisites[1].field, BoardField::IssueState);
+                    assert_eq!(action.prerequisites[1].expected.as_deref(), Some(state));
+                    match &action.intent {
+                        Intent::CloseIssue { .. } => snapshot.items[0].state = "closed".into(),
+                        Intent::SetStatus { value, .. } => {
+                            snapshot.items[0].status = Some(value.clone());
+                        }
+                    }
+                    assert!(
+                        reconcile(&snapshot, &policy, &snapshot.clock)
+                            .unwrap()
+                            .actions
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_and_unauthorized_drift_table() {
+        for (status, state) in [
+            (None, "open"),
+            (Some(Status::Done), "open"),
+            (Some(Status::Backlog), "closed"),
+        ] {
+            for restriction in ["coverage", "fields", "repository", "close_capability"] {
+                let mut snapshot: Snapshot =
+                    serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+                snapshot.items.truncate(1);
+                snapshot.items[0].status = status.clone();
+                snapshot.items[0].state = state.into();
+                let mut policy = Policy {
+                    project: snapshot.project.clone(),
+                    repositories: vec!["example/intake".into()],
+                    capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
+                };
+                match restriction {
+                    "coverage" => snapshot.coverage.complete = false,
+                    "fields" => snapshot.items[0].fields_complete = false,
+                    "repository" => policy.repositories.clear(),
+                    "close_capability" => policy.capabilities = vec![Capability::ProjectFieldEdit],
+                    _ => unreachable!(),
+                }
+                let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
+                let should_block =
+                    restriction != "close_capability" || status == Some(Status::Done);
+                assert_eq!(
+                    plan.actions.is_empty(),
+                    should_block,
+                    "{restriction}: {status:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn rule_table() {

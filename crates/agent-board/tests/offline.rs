@@ -102,6 +102,50 @@ fn emitted_proposal() {
 }
 
 #[test]
+fn terminal_drift_preview_and_emit() {
+    let fixture = format!(
+        "{}/../../fixtures/terminal-drift.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let output = command()
+        .args(["reconcile", "plan", "--snapshot", &fixture])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let plan: Value = serde_json::from_slice(&output).unwrap();
+    let mut reasons: Vec<_> = plan["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| action["reason"].as_str().unwrap())
+        .collect();
+    reasons.sort();
+    assert_eq!(reasons, ["closed_issue_not_done", "done_issue_open"]);
+    let output = command()
+        .args(["reconcile", "plan", "--snapshot", &fixture, "--emit"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let mut proposals: Vec<Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    proposals.sort_by_key(|value| value["type"].as_str().unwrap().to_owned());
+    assert_eq!(
+        proposals,
+        [
+            serde_json::json!({"type":"close_issue", "target_repo":"example/intake", "issue_number":1}),
+            serde_json::json!({"type":"update_project", "project":"https://github.com/orgs/example/projects/1", "content_type":"issue", "content_number":2, "target_repo":"example/intake", "fields":{"Status":"Done"}}),
+        ]
+    );
+}
+
+#[test]
 fn errors_and_help() {
     for args in [
         vec!["project", "view"],
@@ -161,6 +205,7 @@ fn machine_errors_table() {
     }
     command()
         .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
         .args([
             "test",
             "project",
@@ -173,6 +218,7 @@ fn machine_errors_table() {
         .code(4);
     command()
         .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
         .args([
             "test",
             "project",
