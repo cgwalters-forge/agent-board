@@ -102,6 +102,42 @@ fn emitted_proposal() {
 }
 
 #[test]
+fn snapshot_and_project_views() {
+    for args in [["snapshot", "create"], ["project", "view"]] {
+        let output = command()
+            .args(args)
+            .args(["--snapshot", &fixture()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let snapshot: board_core::Snapshot = serde_json::from_slice(&output).unwrap();
+        snapshot.validate().unwrap();
+        assert_eq!(snapshot.items.len(), 2);
+    }
+}
+
+#[test]
+fn live_reads_require_authentication() {
+    for args in [
+        vec!["snapshot", "create"],
+        vec!["project", "view"],
+        vec!["item", "list"],
+        vec!["item", "view", "example/intake#1"],
+        vec!["reconcile", "plan"],
+    ] {
+        command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(args)
+            .args(["--owner", "example", "--project", "1"])
+            .assert()
+            .code(4);
+    }
+}
+
+#[test]
 fn terminal_drift_preview_and_emit() {
     let fixture = format!(
         "{}/../../fixtures/terminal-drift.json",
@@ -209,9 +245,9 @@ fn machine_errors_table() {
         .args([
             "test",
             "project",
-            "--organization",
+            "--owner",
             "cgwalters-forge-stage",
-            "--scratch-repository",
+            "--repo",
             "cgwalters-forge-stage/board-test",
         ])
         .assert()
@@ -222,9 +258,9 @@ fn machine_errors_table() {
         .args([
             "test",
             "project",
-            "--organization",
+            "--owner",
             "cgwalters-forge-stage",
-            "--scratch-repository",
+            "--repo",
             "cgwalters-forge-stage/board-test",
             "--sweep",
         ])

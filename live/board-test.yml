@@ -1,0 +1,24 @@
+name: live board test
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: live-board-test
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    environment: Main
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: cgwalters-forge/agent-board
+          ref: main
+          persist-credentials: false
+      - run: cargo build --locked --release -p agent-board
+      - run: ./target/release/agent-board test project --owner cgwalters-forge-stage --repo cgwalters-forge-stage/board-test
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}

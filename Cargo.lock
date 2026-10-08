@@ -173,6 +173,8 @@ dependencies = [
  "anyhow",
  "board-core",
  "serde_json",
+ "time",
+ "ureq",
  "url",
 ]
 
