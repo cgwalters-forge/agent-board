@@ -239,19 +239,28 @@ fn machine_errors_table() {
             .assert()
             .code(1);
     }
-    command()
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .args([
-            "test",
-            "project",
-            "--owner",
-            "cgwalters-forge-stage",
-            "--repo",
-            "cgwalters-forge-stage/board-test",
-        ])
-        .assert()
-        .code(4);
+    for (mode, code) in [
+        (vec!["--project", "2"], 4),
+        (vec!["--create-project"], 4),
+        (vec![], 1),
+        (vec!["--project", "0"], 1),
+        (vec!["--project", "2", "--create-project"], 1),
+    ] {
+        command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args([
+                "test",
+                "project",
+                "--owner",
+                "cgwalters-forge-stage",
+                "--repo",
+                "cgwalters-forge-stage/board-test",
+            ])
+            .args(mode)
+            .assert()
+            .code(code);
+    }
     command()
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")

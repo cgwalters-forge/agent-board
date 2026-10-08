@@ -19,6 +19,6 @@ jobs:
           ref: main
           persist-credentials: false
       - run: cargo build --locked --release -p agent-board
-      - run: ./target/release/agent-board test project --owner cgwalters-forge-stage --repo cgwalters-forge-stage/board-test
+      - run: ./target/release/agent-board test project --owner cgwalters-forge-stage --project 2 --repo cgwalters-forge-stage/board-test
         env:
           GH_TOKEN: ${{ secrets.PAT }}

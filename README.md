@@ -111,9 +111,11 @@ outputs, one JSON object per line, for a job that applies them.
 
 The model, three rules, the reader for GitHub Projects, and the commands
 above. CI runs them against fixtures on every change. A live test
-creates a throwaway project in a separate organisation, reads it back,
-checks the plan and deletes it; that test is written and has not yet run
-against GitHub.
+uses a kept project in a separate organisation: it opens a scratch issue,
+adds it, sets a field, reads it back and checks the plan, then removes the
+item and closes the issue. The first live run was refused when creating a
+project; this kept-project lane has not yet run against GitHub. Creating
+and deleting a throwaway project is still available with `--create-project`.
 
 Not built yet: the job that applies proposals, the agent runs for triage
 and reporting, asks to the operator, budgets, and any forge but GitHub.
