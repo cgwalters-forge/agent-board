@@ -7,7 +7,6 @@ use time::OffsetDateTime;
 
 const OWNER: &str = "cgwalters-forge-stage";
 const MARKER: &str = "agent-board-fixture/v1\n";
-const MAX_AGE: i64 = 24 * 60 * 60;
 const READ: &str = "query($id:ID!){node(id:$id){... on ProjectV2{id title url readme createdAt owner{... on Organization{login}}}}}";
 const DELETE: &str =
     "mutation($id:ID!){deleteProjectV2(input:{projectId:$id}){deletedProjectV2Id}}";
@@ -20,7 +19,7 @@ pub struct Options {
     scratch_repository: String,
     #[arg(long, default_value = "agent-board-ci-")]
     name_prefix: String,
-    /// Sweep inactive, attributed fixtures older than 24 hours instead of creating one.
+    /// Reserved for sweeping with independently trusted creation receipts (not implemented).
     #[arg(long)]
     sweep: bool,
 }
@@ -32,12 +31,20 @@ impl std::fmt::Display for AuthenticationRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "authentication required: set GH_TOKEN in the protected live environment"
+            "authentication required: provide a valid GH_TOKEN in the protected live environment"
         )
     }
 }
 
 impl std::error::Error for AuthenticationRequired {}
+
+pub fn error_exit_code(error: &anyhow::Error) -> i32 {
+    if error.downcast_ref::<AuthenticationRequired>().is_some() {
+        4
+    } else {
+        1
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -53,7 +60,17 @@ struct Receipt {
 
 trait Transport {
     fn graphql(&mut self, query: &str, variables: Value) -> Result<Value>;
-    fn run_finished(&mut self, repository: &str, id: u64) -> Result<bool>;
+}
+
+fn classify_transport_error(error: ureq::Error) -> anyhow::Error {
+    match error {
+        ureq::Error::StatusCode(401) => AuthenticationRequired.into(),
+        // Do not include server bodies, request headers or arbitrary transport text.
+        ureq::Error::StatusCode(status) => {
+            anyhow::anyhow!("GitHub HTTP request failed (status {status})")
+        }
+        _ => anyhow::anyhow!("GitHub transport failed"),
+    }
 }
 
 struct GitHub {
@@ -69,6 +86,7 @@ impl Transport for GitHub {
             .header("Authorization", &format!("Bearer {}", self.token))
             .header("User-Agent", "agent-board-fixture")
             .send_json(json!({"query":query,"variables":variables}))
+            .map_err(classify_transport_error)
             .context("GitHub GraphQL request failed")?
             .body_mut()
             .read_json()
@@ -82,29 +100,6 @@ impl Transport for GitHub {
             .get("data")
             .cloned()
             .context("missing GraphQL data")
-    }
-
-    fn run_finished(&mut self, repository: &str, id: u64) -> Result<bool> {
-        let response: Value = self
-            .agent
-            .get(&format!(
-                "https://api.github.com/repos/{repository}/actions/runs/{id}"
-            ))
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .header("User-Agent", "agent-board-fixture")
-            .call()
-            .context("read fixture workflow run; unknown runs are not eligible for sweeping")?
-            .body_mut()
-            .read_json()?;
-        ensure!(
-            response["id"].as_u64() == Some(id),
-            "workflow run identity mismatch"
-        );
-        ensure!(
-            response["repository"]["full_name"].as_str() == Some(repository),
-            "workflow repository mismatch"
-        );
-        Ok(response["status"] == "completed")
     }
 }
 
@@ -137,6 +132,9 @@ fn validate_options(options: &Options) -> Result<()> {
 
 pub fn run(options: &Options) -> Result<()> {
     validate_options(options)?;
+    if options.sweep {
+        return sweep();
+    }
     let token = std::env::var("GH_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -149,9 +147,6 @@ pub fn run(options: &Options) -> Result<()> {
             .into(),
     };
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    if options.sweep {
-        return sweep(&mut transport, options, now);
-    }
     ensure!(
         std::env::var("GITHUB_REPOSITORY").ok().as_deref()
             == Some(options.scratch_repository.as_str()),
@@ -291,53 +286,13 @@ fn lifecycle(t: &mut impl Transport, options: &Options, receipt: &Receipt) -> Re
     }
 }
 
-fn sweep(t: &mut impl Transport, options: &Options, now: i64) -> Result<()> {
-    let mut cursor: Option<String> = None;
-    let mut seen = std::collections::BTreeSet::new();
-    loop {
-        let page = t.graphql("query($owner:String!,$cursor:String){organization(login:$owner){projectsV2(first:100,after:$cursor){nodes{id title url readme createdAt owner{... on Organization{login}}} pageInfo{hasNextPage endCursor}}}}", json!({"owner":options.organization,"cursor":cursor}))?;
-        let connection = &page["organization"]["projectsV2"];
-        let nodes = connection["nodes"]
-            .as_array()
-            .context("incomplete project census")?;
-        for project in nodes {
-            ensure!(project.is_object(), "redacted project in census");
-            let Some(raw) = project["readme"]
-                .as_str()
-                .and_then(|s| s.strip_prefix(MARKER))
-            else {
-                continue;
-            };
-            let Ok(receipt) = serde_json::from_str::<Receipt>(raw) else {
-                continue;
-            };
-            let id = project["id"].as_str().context("missing project identity")?;
-            if verify(project, id, &receipt, options).is_err()
-                || now.saturating_sub(receipt.created) <= MAX_AGE
-            {
-                continue;
-            }
-            if !t.run_finished(&receipt.repository, receipt.run_id)? {
-                continue;
-            }
-            // Re-read provenance and age immediately before delete, never delete by prefix alone.
-            cleanup(t, id, &receipt, options)?;
-            println!("Swept inactive fixture {id}");
-        }
-        match connection["pageInfo"]["hasNextPage"].as_bool() {
-            Some(false) => break,
-            Some(true) => {
-                let next = connection["pageInfo"]["endCursor"]
-                    .as_str()
-                    .context("missing census cursor")?
-                    .to_owned();
-                ensure!(seen.insert(next.clone()), "repeated census cursor");
-                cursor = Some(next);
-            }
-            None => bail!("incomplete census pageInfo"),
-        }
-    }
-    Ok(())
+fn sweep() -> Result<()> {
+    // The editable project README and a completed run do not authenticate creation.
+    // No trusted receipt backend exists yet. Refuse before even constructing a
+    // credential-bearing client, rather than expose a self-attested deletion path.
+    bail!(
+        "unsupported_capability: sweeping requires independently trusted creation receipts binding project ID, nonce, run/attempt and approved workflow identity; use manual recovery"
+    )
 }
 
 #[cfg(test)]
@@ -348,7 +303,6 @@ mod tests {
     struct Recorded {
         responses: VecDeque<Value>,
         deletes: usize,
-        finished: bool,
     }
 
     impl Transport for Recorded {
@@ -357,10 +311,6 @@ mod tests {
                 self.deletes += 1;
             }
             self.responses.pop_front().context("unexpected request")
-        }
-
-        fn run_finished(&mut self, _: &str, _: u64) -> Result<bool> {
-            Ok(self.finished)
         }
     }
 
@@ -403,7 +353,6 @@ mod tests {
             let mut transport = Recorded {
                 responses: vec![json!({"node":changed})].into(),
                 deletes: 0,
-                finished: true,
             };
             assert!(cleanup(&mut transport, "P_fixture", &receipt, &options).is_err());
             assert_eq!(transport.deletes, 0);
@@ -419,51 +368,36 @@ mod tests {
             json!({"updateProjectV2":{"projectV2":{"id":"P_fixture"}}}),
             json!({"node":project}), json!({"node":project}),
             json!({"deleteProjectV2":{"deletedProjectV2Id":"P_fixture"}}), json!({"node":null}),
-        ].into(), deletes: 0, finished: true };
+        ].into(), deletes: 0 };
         lifecycle(&mut transport, &options, &receipt).unwrap();
         assert_eq!(transport.deletes, 1);
         assert!(transport.responses.is_empty());
     }
 
     #[test]
-    fn sweeper_age_and_active_table() {
-        let (options, _, project) = fixture();
-        for (age, finished, deletes) in [
-            (MAX_AGE, true, 0),
-            (MAX_AGE + 1, false, 0),
-            (MAX_AGE + 1, true, 1),
-        ] {
-            let mut responses = VecDeque::from([
-                json!({"organization":{"projectsV2":{"nodes":[project],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
-            ]);
-            if deletes == 1 {
-                responses.extend([
-                    json!({"node":project}),
-                    json!({"deleteProjectV2":{"deletedProjectV2Id":"P_fixture"}}),
-                    json!({"node":null}),
-                ]);
-            }
-            let mut transport = Recorded {
-                responses,
-                deletes: 0,
-                finished,
-            };
-            sweep(&mut transport, &options, age).unwrap();
-            assert_eq!(transport.deletes, deletes);
-            assert!(transport.responses.is_empty());
-        }
-    }
-
-    #[test]
-    fn repeated_cursor_refused() {
-        let (options, _, _) = fixture();
-        let page = json!({"organization":{"projectsV2":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"same"}}}});
-        let mut transport = Recorded {
-            responses: vec![page.clone(), page].into(),
-            deletes: 0,
-            finished: true,
-        };
-        assert!(sweep(&mut transport, &options, MAX_AGE + 1).is_err());
+    fn fully_forged_receipt_cannot_authorize_sweeping() {
+        let (mut options, receipt, mut project) = fixture();
+        project["id"] = "P_nonfixture".into();
+        // This forged object passes all of the old self-attestation checks,
+        // including a valid nonce, timestamp and real-looking run identity.
+        verify(&project, "P_nonfixture", &receipt, &options).unwrap();
+        let decoded: Receipt = serde_json::from_str(
+            project["readme"]
+                .as_str()
+                .unwrap()
+                .strip_prefix(MARKER)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded.run_id, 123);
+        options.sweep = true;
+        // No token, network, run-status lookup or delete is reachable in this mode.
+        assert!(
+            run(&options)
+                .unwrap_err()
+                .to_string()
+                .contains("independently trusted creation receipts")
+        );
     }
 
     #[test]
@@ -477,11 +411,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_provenance_is_not_swept() {
-        let (options, _, mut project) = fixture();
-        project["readme"] = Value::Null;
-        let mut transport = Recorded { responses: vec![json!({"organization":{"projectsV2":{"nodes":[project],"pageInfo":{"hasNextPage":false}}}})].into(), deletes: 0, finished: true };
-        sweep(&mut transport, &options, MAX_AGE + 1).unwrap();
-        assert_eq!(transport.deletes, 0);
+    fn http_authentication_table() {
+        for (status, authentication) in [(401, true), (403, false), (429, false), (500, false)] {
+            let error =
+                classify_transport_error(ureq::Error::StatusCode(status)).context("request failed");
+            assert_eq!(
+                error.downcast_ref::<AuthenticationRequired>().is_some(),
+                authentication
+            );
+            assert_eq!(error_exit_code(&error), if authentication { 4 } else { 1 });
+            assert!(!format!("{error:#}").contains("response body"));
+        }
     }
 }
