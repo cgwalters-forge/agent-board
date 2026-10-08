@@ -205,6 +205,32 @@ Offline fixtures cover pagination, redacted/null nodes, permissions, rate limits
 
 ## 7. Rust boundaries and the first six PRs
 
+### Current implementation limits
+
+The workspace currently implements offline snapshots, the single missing-status
+rule, preview-only GitHub proposal lowering, and immediate staging fixture
+create/read/delete. It does not complete step 1's protected workflow, scheduled
+sweeper or pinned agentic-job caller requirements. No live execution or pinned
+external handler/bounds contract has been verified here.
+
+`test project --sweep` fails before authentication or network access. Editable
+project descriptions and completed Actions runs cannot prove who created a
+project. Re-enabling sweeping requires an independently authenticated creation
+receipt binding the returned project ID, nonce, run ID/attempt and approved
+workflow identity; missing proof must leave a project untouched. Immediate cleanup
+retains its trust anchor in memory: the ID returned by creation and the locally
+generated nonce. Crashes require manual recovery until the trusted receipt store
+and protected sweeper are implemented.
+
+The current `board-snapshot/v1` reader rejects unknown fields at every nested
+record boundary. Status, Priority and Turn must be present, with explicit JSON
+null for an observed unset value; omission is a schema error, not null. Evidence
+may be omitted and defaults to an empty list. Unknown schema versions are rejected
+by validation. This is a deliberately strict input policy, not forward-compatible
+field discovery. GitHub issue/project URL grammar belongs to board-forge; core
+validates only generic identities and canonical HTTPS project URLs. The CLI
+supplies the default GitHub hostname.
+
 Use three crates: board-core for domain types, versioned snapshots/plans, pure rules and budget arithmetic; board-forge for GitHub reads, capability discovery and safe-output lowering; agent-board for CLI, orchestration and the Rust integration-fixture driver. Keep skills, schemas, fixtures and rule tables in normal repository directories. No shell program longer than ten lines. Nontrivial fixture logic belongs in Rust; a small standard-library Node wrapper may call pinned gh-aw handlers without duplicating their sanitization.
 
 Core types include ItemRef, ChangeRef, RunRef, Actor, BoardField, Evidence, Snapshot, Intent, Precondition and Capability, not GraphQL IDs or handler JSON fields. A read Forge trait exposes board schema/membership, repository issue inventory, issue/thread/relationship facts, PR state/reviews and runs, each with completeness/freshness. A separate OutputBackend lowers typed intentions to the bounded write protocol or returns unsupported capability; it does not grant a model a mutation client. Native identity includes host.

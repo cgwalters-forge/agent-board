@@ -173,6 +173,7 @@ dependencies = [
  "anyhow",
  "board-core",
  "serde_json",
+ "url",
 ]
 
 [[package]]

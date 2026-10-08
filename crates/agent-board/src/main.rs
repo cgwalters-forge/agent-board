@@ -1,8 +1,8 @@
 mod live;
 
 use anyhow::{Context, Result, bail, ensure};
-use board_core::{Capability, ItemRef, Policy, Snapshot};
-use board_forge::{GitHubSafeOutputs, OutputBackend};
+use board_core::{Capability, Policy, Snapshot};
+use board_forge::{GitHubSafeOutputs, OutputBackend, parse_github_item};
 use clap::{Args, Parser, Subcommand};
 use jaq_interpret::FilterT;
 use serde_json::Value;
@@ -26,6 +26,8 @@ struct Cli {
     jq: Option<String>,
     #[arg(short = 'R', long, global = true)]
     repo: Option<String>,
+    #[arg(long, global = true, default_value = "github.com")]
+    hostname: String,
     #[arg(long, global = true)]
     template: Option<String>,
     #[command(subcommand)]
@@ -164,16 +166,7 @@ fn main() {
     };
     if let Err(error) = execute(cli) {
         eprintln!("error: {error:#}");
-        std::process::exit(
-            if error
-                .downcast_ref::<live::AuthenticationRequired>()
-                .is_some()
-            {
-                4
-            } else {
-                1
-            },
-        );
+        std::process::exit(live::error_exit_code(&error));
     }
 }
 
@@ -247,7 +240,7 @@ fn execute(cli: Cli) -> Result<()> {
             command: Item::View { item },
         } => {
             let snapshot = load(&cli)?;
-            let identity = ItemRef::parse(item, cli.repo.as_deref())?;
+            let identity = parse_github_item(item, cli.repo.as_deref(), &cli.hostname)?;
             let item = snapshot
                 .items
                 .iter()
@@ -324,11 +317,7 @@ fn item_json(item: &board_core::Item) -> Result<Value> {
     let mut value = serde_json::to_value(item)?;
     value["number"] = item.identity.number.into();
     value["repository"] = item.identity.repository.clone().into();
-    value["url"] = format!(
-        "https://{}/{}/issues/{}",
-        item.identity.host, item.identity.repository, item.identity.number
-    )
-    .into();
+    value["url"] = board_forge::github_item_url(&item.identity)?.into();
     Ok(value)
 }
 

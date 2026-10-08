@@ -9,6 +9,7 @@ pub const SNAPSHOT_SCHEMA: &str = "board-snapshot/v1";
 pub const PLAN_SCHEMA: &str = "board-plan/v1";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 pub struct ItemRef {
     pub host: String,
     pub repository: String,
@@ -25,7 +26,7 @@ impl ItemRef {
         );
         let parts: Vec<_> = self.repository.split('/').collect();
         ensure!(
-            parts.len() == 2
+            parts.len() >= 2
                 && parts.iter().all(|part| !part.is_empty()
                     && *part != "."
                     && *part != ".."
@@ -38,64 +39,20 @@ impl ItemRef {
         Ok(())
     }
 
-    pub fn parse(input: &str, repository: Option<&str>) -> Result<Self> {
-        let (host, repository, number) = if input.contains("://") {
-            let url = Url::parse(input)?;
-            ensure!(url.scheme() == "https", "issue URLs must use HTTPS");
-            ensure!(
-                url.username().is_empty()
-                    && url.password().is_none()
-                    && url.query().is_none()
-                    && url.fragment().is_none(),
-                "issue URL must be canonical"
-            );
-            let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
-            ensure!(
-                parts.len() == 4 && parts[2] == "issues",
-                "expected an issue URL"
-            );
-            (
-                url.host_str().context("missing issue URL host")?.to_owned(),
-                format!("{}/{}", parts[0], parts[1]),
-                parts[3].parse()?,
-            )
-        } else {
-            let (repo, number) = match input.rsplit_once('#') {
-                Some(parts) => parts,
-                None => (
-                    repository.ok_or_else(|| anyhow::anyhow!("bare numbers require --repo"))?,
-                    input,
-                ),
-            };
-            ("github.com".into(), repo.into(), number.parse()?)
-        };
-        ensure!(
-            number > 0
-                && repository.split('/').count() == 2
-                && !repository.split('/').any(str::is_empty),
-            "invalid issue identity"
-        );
-        let identity = Self {
-            host,
-            repository,
-            number,
-        };
-        identity.validate()?;
-        Ok(identity)
-    }
-
     pub fn display(&self) -> String {
         format!("{}#{}", self.repository, self.number)
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeRef {
     pub item: ItemRef,
     pub revision: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RunRef {
     pub host: String,
     pub repository: String,
@@ -105,6 +62,7 @@ pub struct RunRef {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Actor {
     pub host: String,
     pub login: String,
@@ -160,6 +118,7 @@ pub enum Priority {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Evidence {
     pub url: Url,
     pub observed_at: String,
@@ -167,25 +126,41 @@ pub struct Evidence {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Coverage {
     pub complete: bool,
     pub observed_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Item {
     pub identity: ItemRef,
     pub title: String,
     pub state: String,
+    #[serde(deserialize_with = "required_nullable")]
     pub status: Option<Status>,
+    #[serde(deserialize_with = "required_nullable")]
     pub priority: Option<Priority>,
+    #[serde(deserialize_with = "required_nullable")]
     pub turn: Option<Turn>,
     pub fields_complete: bool,
     #[serde(default)]
     pub evidence: Vec<Evidence>,
 }
 
+// A missing field is unknown input, not an observed null. Using a custom
+// deserializer prevents serde's implicit default for Option fields.
+fn required_nullable<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Snapshot {
     pub schema: String,
     pub project: Url,
@@ -212,17 +187,6 @@ impl Snapshot {
                 && self.project.fragment().is_none(),
             "project URL must be canonical"
         );
-        if self.project.host_str() == Some("github.com") {
-            let parts: Vec<_> = self.project.path().trim_matches('/').split('/').collect();
-            ensure!(
-                parts.len() == 4
-                    && ["orgs", "users"].contains(&parts[0])
-                    && !parts[1].is_empty()
-                    && parts[2] == "projects"
-                    && parts[3].parse::<u64>().is_ok_and(|n| n > 0),
-                "invalid GitHub project URL"
-            );
-        }
         time::OffsetDateTime::parse(&self.clock, &time::format_description::well_known::Rfc3339)
             .context("invalid snapshot clock")?;
         time::OffsetDateTime::parse(
@@ -252,6 +216,7 @@ pub enum Capability {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub project: Url,
     pub repositories: Vec<String>,
@@ -259,6 +224,7 @@ pub struct Policy {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Precondition {
     pub item: ItemRef,
     pub field: BoardField,
@@ -266,12 +232,13 @@ pub struct Precondition {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Intent {
     SetStatus { item: ItemRef, value: Status },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Action {
     pub key: String,
     pub reason: String,
@@ -281,6 +248,7 @@ pub struct Action {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Plan {
     pub schema: String,
     pub project: Url,
@@ -390,20 +358,18 @@ mod tests {
     }
 
     #[test]
-    fn identity_table() {
-        for input in [
-            "example/intake#1",
-            "https://github.com/example/intake/issues/1",
-        ] {
-            assert_eq!(ItemRef::parse(input, None).unwrap().number, 1);
-        }
-        for input in [
-            "1",
-            "example/intake#0",
-            "https://github.com/example/intake/pull/1",
-        ] {
-            assert!(ItemRef::parse(input, None).is_err());
-        }
+    fn neutral_identity_and_project() {
+        let identity = ItemRef {
+            host: "forge.example".into(),
+            repository: "group/subgroup/repository".into(),
+            number: 1,
+        };
+        identity.validate().unwrap();
+        let mut snapshot: Snapshot =
+            serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+        snapshot.project = Url::parse("https://forge.example/group/board").unwrap();
+        snapshot.items[0].identity = identity;
+        snapshot.validate().unwrap();
     }
 
     #[test]
@@ -421,8 +387,66 @@ mod tests {
         }
         let mut snapshot: Snapshot =
             serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
-        snapshot.project = Url::parse("https://github.com/not-a-project").unwrap();
+        snapshot.project = Url::parse("http://forge.example/board").unwrap();
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_snapshot_version_is_rejected() {
+        let mut snapshot: Snapshot =
+            serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+        snapshot.schema = "board-snapshot/v2".into();
+        assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_snapshot_fields_are_rejected() {
+        let original: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+        for pointer in ["", "/coverage", "/items/0", "/items/0/identity"] {
+            let mut value = original.clone();
+            value
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown".into(), true.into());
+            assert!(
+                serde_json::from_value::<Snapshot>(value).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut unknown_evidence = original;
+        unknown_evidence["items"][0]["evidence"] = serde_json::json!([{
+            "url": "https://forge.example/evidence",
+            "observed_at": "2026-10-08T00:00:00Z",
+            "provenance": "fixture",
+            "unknown": true,
+        }]);
+        assert!(serde_json::from_value::<Snapshot>(unknown_evidence).is_err());
+    }
+
+    #[test]
+    fn missing_status_is_not_observed_null() {
+        let original: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+        let mut missing = original.clone();
+        missing["items"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        assert!(serde_json::from_value::<Snapshot>(missing.clone()).is_err());
+        missing["items"][0]["sta tus"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Snapshot>(missing).is_err());
+        let mut explicit_null = original;
+        explicit_null["items"][0]["status"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<Snapshot>(explicit_null)
+                .unwrap()
+                .items[0]
+                .status
+                .is_none()
+        );
     }
 
     #[test]

@@ -27,6 +27,32 @@ fn offline_table() {
         (
             vec![
                 "item",
+                "view",
+                "https://github.com/example/intake/issues/1",
+                "--json",
+                "number",
+                "--jq",
+                ".number",
+            ],
+            "1\n",
+        ),
+        (
+            vec![
+                "item",
+                "view",
+                "1",
+                "-R",
+                "example/intake",
+                "--json",
+                "number",
+                "--jq",
+                ".number",
+            ],
+            "1\n",
+        ),
+        (
+            vec![
+                "item",
                 "list",
                 "--status",
                 "Triage",
@@ -82,6 +108,13 @@ fn errors_and_help() {
         vec!["item", "list"],
         vec!["item", "list", "--unknown"],
         vec!["item", "view", "1", "--snapshot", &fixture()],
+        vec![
+            "item",
+            "view",
+            "https://forge.example/example/intake/issues/1",
+            "--snapshot",
+            &fixture(),
+        ],
     ] {
         command().args(args).assert().code(1);
     }
@@ -138,4 +171,17 @@ fn machine_errors_table() {
         ])
         .assert()
         .code(4);
+    command()
+        .env_remove("GH_TOKEN")
+        .args([
+            "test",
+            "project",
+            "--organization",
+            "cgwalters-forge-stage",
+            "--scratch-repository",
+            "cgwalters-forge-stage/board-test",
+            "--sweep",
+        ])
+        .assert()
+        .code(1);
 }
