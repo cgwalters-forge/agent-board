@@ -104,6 +104,12 @@ impl OutputBackend for GitHubSafeOutputs {
         validate_github_project(&plan.project)?;
         ensure!(plan.actions.len() <= 10, "proposal limit exceeded (10)");
         plan.actions.iter().map(|action| match &action.intent {
+            Intent::CloseIssue { item } => {
+                ensure!(item.host == "github.com", "item host mismatch");
+                item.validate()?;
+                ensure!(item.repository.split('/').count() == 2, "invalid GitHub repository");
+                Ok(json!({"type":"close_issue", "target_repo":item.repository, "issue_number":item.number}))
+            }
             Intent::SetStatus { item, value } => {
                 ensure!(item.host == "github.com", "item host mismatch");
                 item.validate()?;
@@ -179,5 +185,40 @@ mod tests {
                 json!({"type":"update_project","project":snapshot.project,"content_type":"issue","content_number":1,"target_repo":"example/intake","fields":{"Status":"Triage"}})
             ]
         );
+    }
+
+    #[test]
+    fn terminal_proposal_table() {
+        for (state, status, expected) in [
+            (
+                "open",
+                Some(board_core::Status::Done),
+                json!({
+                    "type":"close_issue", "target_repo":"example/intake", "issue_number":1
+                }),
+            ),
+            (
+                "closed",
+                Some(board_core::Status::Backlog),
+                json!({
+                    "type":"update_project", "project":"https://github.com/orgs/example/projects/1",
+                    "content_type":"issue", "content_number":1, "target_repo":"example/intake",
+                    "fields":{"Status":"Done"}
+                }),
+            ),
+        ] {
+            let mut snapshot: Snapshot =
+                serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+            snapshot.items.truncate(1);
+            snapshot.items[0].state = state.into();
+            snapshot.items[0].status = status;
+            let policy = Policy {
+                project: snapshot.project.clone(),
+                repositories: vec!["example/intake".into()],
+                capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
+            };
+            let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
+            assert_eq!(GitHubSafeOutputs.lower(&plan).unwrap(), vec![expected]);
+        }
     }
 }

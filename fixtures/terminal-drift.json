@@ -1,0 +1,10 @@
+{
+  "schema": "board-snapshot/v1",
+  "project": "https://github.com/orgs/example/projects/1",
+  "clock": "2026-10-08T00:00:00Z",
+  "coverage": {"complete": true, "observed_at": "2026-10-08T00:00:00Z"},
+  "items": [
+    {"identity":{"host":"github.com","repository":"example/intake","number":1},"title":"Done but still open","state":"open","status":"Done","priority":"P2","turn":"None","fields_complete":true},
+    {"identity":{"host":"github.com","repository":"example/intake","number":2},"title":"Closed but still in progress","state":"closed","status":"In Progress","priority":"P1","turn":"Worker","fields_complete":true}
+  ]
+}

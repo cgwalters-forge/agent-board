@@ -272,7 +272,7 @@ fn execute(cli: Cli) -> Result<()> {
                     .iter()
                     .map(|item| item.identity.repository.clone())
                     .collect(),
-                capabilities: vec![Capability::ProjectFieldEdit],
+                capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
             };
             let plan = board_core::reconcile(&snapshot, &policy, &snapshot.clock)?;
             if *emit {
