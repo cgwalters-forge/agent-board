@@ -106,6 +106,27 @@ pub trait Transport {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value>;
 }
 
+// Shared across every connection and per-item read in one snapshot. Exhaustion
+// returns an error, never a partial snapshot that could yield proposals.
+const SNAPSHOT_REQUEST_LIMIT: usize = 1_000;
+
+struct ReadBudget<'a, T> {
+    transport: &'a T,
+    remaining: std::cell::Cell<usize>,
+}
+
+impl<T: Transport> Transport for ReadBudget<'_, T> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let remaining = self.remaining.get();
+        ensure!(
+            remaining > 0,
+            "GitHub snapshot request budget exhausted; no snapshot produced"
+        );
+        self.remaining.set(remaining - 1);
+        self.transport.graphql(query, variables)
+    }
+}
+
 pub struct Client {
     token: String,
     agent: ureq::Agent,
@@ -272,19 +293,23 @@ impl<T: Transport> Forge for GitHub<T> {
 
     fn snapshot(&self) -> Result<Snapshot> {
         ensure!(self.number > 0, "project number must be positive");
-        let data = self.transport.graphql("query($owner:String!,$number:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$number){id url}} ... on User{projectV2(number:$number){id url}}}}", json!({"owner":self.owner,"number":self.number}))?;
+        let transport = ReadBudget {
+            transport: &self.transport,
+            remaining: std::cell::Cell::new(SNAPSHOT_REQUEST_LIMIT),
+        };
+        let data = transport.graphql("query($owner:String!,$number:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$number){id url}} ... on User{projectV2(number:$number){id url}}}}", json!({"owner":self.owner,"number":self.number}))?;
         let project = &data["repositoryOwner"]["projectV2"];
         let id = text(project, "id")?;
         let clock = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)?;
         let (fields, mut complete) = connection(
-            &self.transport,
+            &transport,
             "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{fields(first:100,after:$cursor){nodes{... on ProjectV2Field{id name dataType} ... on ProjectV2SingleSelectField{id name dataType options{id name}} ... on ProjectV2IterationField{id name dataType configuration{iterations{id title startDate duration} completedIterations{id title startDate duration}}}} pageInfo{hasNextPage endCursor}}}}}",
             json!({"id":id}),
             "/node/fields",
         )?;
         let (members, members_complete) = connection(
-            &self.transport,
+            &transport,
             "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){nodes{id content{__typename ... on Issue{id number title state createdAt updatedAt closedAt repository{nameWithOwner}} ... on PullRequest{id number title state createdAt updatedAt closedAt mergedAt repository{nameWithOwner}}}} pageInfo{hasNextPage endCursor}}}}}",
             json!({"id":id}),
             "/node/items",
@@ -306,7 +331,7 @@ impl<T: Transport> Forge for GitHub<T> {
                 "unknown GitHub content state"
             );
             let (values, values_complete) = connection(
-                &self.transport,
+                &transport,
                 "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2Item{fieldValues(first:100,after:$cursor){nodes{__typename ... on ProjectV2ItemFieldSingleSelectValue{name optionId field{... on ProjectV2SingleSelectField{name}}} ... on ProjectV2ItemFieldTextValue{text field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldNumberValue{number field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldDateValue{date field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldIterationValue{title iterationId field{... on ProjectV2IterationField{name}}} ... on ProjectV2ItemFieldRepositoryValue{repository{id nameWithOwner} field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldMilestoneValue{milestone{id title state dueOn} field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldLabelValue{id field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldUserValue{id field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldPullRequestValue{id field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldReviewerValue{id field{... on ProjectV2Field{name}}}} pageInfo{hasNextPage endCursor}}}}}",
                 json!({"id":text(&member,"id")?}),
                 "/node/fieldValues",
@@ -332,7 +357,7 @@ impl<T: Transport> Forge for GitHub<T> {
                         "query($id:ID!,$cursor:String){{node(id:$id){{... on {ty}{{{field}(first:100,after:$cursor){{nodes{{{selection}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
                     );
                     let (nodes, full) = connection(
-                        &self.transport,
+                        &transport,
                         &query,
                         json!({"id":text(&value,"id")?}),
                         &format!("/node/{field}"),
@@ -361,7 +386,7 @@ impl<T: Transport> Forge for GitHub<T> {
                     "query($id:ID!,$cursor:String){{node(id:$id){{... on Issue{{{field}(first:100,after:$cursor){{nodes{{{selection}}} pageInfo{{hasNextPage endCursor}}}}}} ... on PullRequest{{{field}(first:100,after:$cursor){{nodes{{{selection}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
                 );
                 let (nodes, full) = connection(
-                    &self.transport,
+                    &transport,
                     &query,
                     json!({"id":content_id}),
                     &format!("/node/{field}"),
@@ -602,6 +627,60 @@ mod tests {
                 assert_eq!(t.variables.borrow()[1]["cursor"], "next");
             }
         }
+    }
+
+    #[test]
+    fn aggregate_request_budget_table() {
+        for (pages, limit, succeeds) in [(2, 2, true), (3, 2, false)] {
+            let t = Recorded {
+                responses: RefCell::new(
+                    (0..pages)
+                        .map(|i| page(json!([]), i + 1 < pages, json!(format!("cursor-{i}"))))
+                        .collect(),
+                ),
+                variables: RefCell::new(vec![]),
+            };
+            let budget = ReadBudget {
+                transport: &t,
+                remaining: std::cell::Cell::new(limit),
+            };
+            let result = connection(&budget, "recorded", json!({}), "/node/connection");
+            assert_eq!(result.is_ok(), succeeds);
+            if !succeeds {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("request budget exhausted")
+                );
+            }
+            assert_eq!(t.variables.borrow().len(), limit);
+            // A second connection cannot reset the snapshot's aggregate budget.
+            assert!(connection(&budget, "another", json!({}), "/node/connection").is_err());
+            assert_eq!(t.variables.borrow().len(), limit);
+        }
+    }
+
+    #[test]
+    fn snapshot_unique_cursor_exhaustion() {
+        let mut responses = vec![json!({"repositoryOwner":{"projectV2":{"id":"P"}}})];
+        for i in 1..SNAPSHOT_REQUEST_LIMIT {
+            responses.push(json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":format!("cursor-{i}")}}}}));
+        }
+        let github = GitHub {
+            transport: Recorded {
+                responses: RefCell::new(responses.into()),
+                variables: RefCell::new(vec![]),
+            },
+            owner: "example".into(),
+            number: 1,
+        };
+        let error = github.snapshot().unwrap_err();
+        assert!(error.to_string().contains("request budget exhausted"));
+        assert_eq!(
+            github.transport.variables.borrow().len(),
+            SNAPSHOT_REQUEST_LIMIT
+        );
     }
 
     #[test]

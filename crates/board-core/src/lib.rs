@@ -149,6 +149,7 @@ pub struct Item {
     #[serde(default)]
     pub evidence: Vec<Evidence>,
     #[serde(default)]
+    // Legacy snapshots may omit this, but absence never establishes Issue identity.
     pub content_kind: String,
     #[serde(default)]
     pub labels: Vec<String>,
@@ -307,6 +308,13 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
         if item.content_kind == "pull_request" {
             continue;
         }
+        if item.content_kind != "issue" {
+            plan.diagnostics.insert(
+                item.identity.display(),
+                "missing_data: unknown content kind; issue identity required".into(),
+            );
+            continue;
+        }
         if !item.fields_complete {
             plan.diagnostics.insert(
                 item.identity.display(),
@@ -385,6 +393,57 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_kind_table() {
+        for kind in [
+            None,
+            Some(""),
+            Some("unknown"),
+            Some("issue"),
+            Some("pull_request"),
+        ] {
+            for (status, state) in [
+                (Some(Status::Done), "open"),
+                (Some(Status::Backlog), "closed"),
+                (None, "open"),
+            ] {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+                if let Some(kind) = kind {
+                    value["items"][0]["content_kind"] = kind.into();
+                } else {
+                    value["items"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("content_kind");
+                }
+                let mut snapshot: Snapshot = serde_json::from_value(value).unwrap();
+                snapshot.items.truncate(1);
+                snapshot.items[0].status = status;
+                snapshot.items[0].state = state.into();
+                let policy = Policy {
+                    project: snapshot.project.clone(),
+                    repositories: vec!["example/intake".into()],
+                    capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
+                };
+                let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
+                assert_eq!(
+                    plan.actions.len(),
+                    usize::from(kind == Some("issue")),
+                    "{kind:?}/{state}"
+                );
+                let unknown = !matches!(kind, Some("issue" | "pull_request"));
+                assert_eq!(plan.diagnostics.len(), usize::from(unknown));
+                if unknown {
+                    assert!(
+                        plan.diagnostics[&snapshot.items[0].identity.display()]
+                            .contains("issue identity required")
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn terminal_drift_table() {
