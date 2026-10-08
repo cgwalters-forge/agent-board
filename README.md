@@ -113,8 +113,10 @@ The model, three rules, the reader for GitHub Projects, and the commands
 above. CI runs them against fixtures on every change. A live test
 uses a kept project in a separate organisation: it opens a scratch issue,
 adds it, sets a field, reads it back and checks the plan, then removes the
-item and closes the issue. The first live run was refused when creating a
-project; this kept-project lane has not yet run against GitHub. Creating
+item and closes the issue. It runs from cgwalters-forge-stage/board-test
+against a kept project there; its [first runs](https://github.com/cgwalters-forge-stage/board-test/actions/runs/37742267130)
+were refused by GitHub because the token in that repository cannot yet
+access the project, and it has not yet passed. Creating
 and deleting a throwaway project is still available with `--create-project`.
 
 Not built yet: the job that applies proposals, the agent runs for triage

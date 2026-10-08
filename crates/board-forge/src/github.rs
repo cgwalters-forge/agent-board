@@ -106,6 +106,200 @@ pub trait Transport {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value>;
 }
 
+/// Attach the operation and its fine-grained permission to live failures.
+pub struct DiagnosticTransport<'a, T> {
+    pub transport: &'a T,
+    pub project: String,
+    pub repository: String,
+}
+
+fn operation(query: &str) -> (&str, &str, bool) {
+    for (marker, step, permission, repository) in [
+        (
+            "createIssue(",
+            "opening the scratch issue",
+            "repository Issues write",
+            true,
+        ),
+        (
+            "closeIssue(",
+            "closing the scratch issue",
+            "repository Issues write",
+            true,
+        ),
+        (
+            "repository(owner:",
+            "reading repository",
+            "repository Metadata read",
+            true,
+        ),
+        (
+            "createProjectV2(",
+            "creating project",
+            "organization Projects write",
+            false,
+        ),
+        (
+            "deleteProjectV2(",
+            "deleting project",
+            "organization Projects write",
+            false,
+        ),
+        (
+            "addProjectV2ItemById(",
+            "adding the issue to project",
+            "organization Projects write",
+            false,
+        ),
+        (
+            "deleteProjectV2Item(",
+            "removing the issue from project",
+            "organization Projects write",
+            false,
+        ),
+        (
+            "createProjectV2Field(",
+            "creating Fixture nonce field in project",
+            "organization Projects write",
+            false,
+        ),
+        (
+            "updateProjectV2ItemFieldValue(",
+            "setting field in project",
+            "organization Projects write",
+            false,
+        ),
+        (
+            "fieldValues(first",
+            "reading item field values in project",
+            "organization Projects read",
+            false,
+        ),
+        (
+            "fields(first",
+            "reading field schema in project",
+            "organization Projects read",
+            false,
+        ),
+        (
+            "items(first",
+            "reading membership in project",
+            "organization Projects read",
+            false,
+        ),
+        (
+            "labels(first",
+            "reading labels in project",
+            "repository Issues read",
+            false,
+        ),
+        (
+            "assignees(first",
+            "reading assignees in project",
+            "repository Issues read",
+            false,
+        ),
+    ] {
+        if query.contains(marker) {
+            return (step, permission, repository);
+        }
+    }
+    ("reading project", "organization Projects read", false)
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn step_permissions() {
+        for (query, expected) in [
+            ("projectV2(number", "organization Projects read"),
+            ("fields(first", "organization Projects read"),
+            ("items(first", "organization Projects read"),
+            ("fieldValues(first", "organization Projects read"),
+            ("createProjectV2(", "organization Projects write"),
+            ("deleteProjectV2(", "organization Projects write"),
+            ("addProjectV2ItemById(", "organization Projects write"),
+            ("deleteProjectV2Item(", "organization Projects write"),
+            ("createProjectV2Field(", "organization Projects write"),
+            (
+                "updateProjectV2ItemFieldValue(",
+                "organization Projects write",
+            ),
+            ("createIssue(", "repository Issues write"),
+            ("closeIssue(", "repository Issues write"),
+            ("repository(owner:", "repository Metadata read"),
+            ("labels(first", "repository Issues read"),
+            ("assignees(first", "repository Issues read"),
+        ] {
+            assert_eq!(operation(query).1, expected, "{query}");
+            for refusal in [
+                "FORBIDDEN",
+                "GitHub HTTP status 403",
+                "GitHub HTTP status 404",
+                "network failure",
+            ] {
+                struct Refused<'a>(&'a str);
+                impl Transport for Refused<'_> {
+                    fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+                        anyhow::bail!("{}", self.0)
+                    }
+                }
+                let transport = DiagnosticTransport {
+                    transport: &Refused(refusal),
+                    project: "org/2".into(),
+                    repository: "org/repo".into(),
+                };
+                let error = format!("{:#}", transport.graphql(query, json!({})).unwrap_err());
+                assert!(error.contains(if operation(query).2 {
+                    "org/repo"
+                } else {
+                    "org/2"
+                }));
+                assert_eq!(error.contains(expected), refusal != "network failure");
+                assert_eq!(
+                    error.contains("pending approval"),
+                    refusal != "network failure"
+                );
+            }
+        }
+    }
+}
+
+impl<T: Transport> Transport for DiagnosticTransport<'_, T> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let (step, permission, repository) = operation(query);
+        let target = if repository {
+            &self.repository
+        } else {
+            &self.project
+        };
+        let detail = if query.contains("updateProjectV2ItemFieldValue(") {
+            if variables["value"].get("singleSelectOptionId").is_some() {
+                "setting Status in project"
+            } else {
+                "setting Fixture nonce in project"
+            }
+        } else {
+            step
+        };
+        let context = format!(
+            "{detail} {target} (node {})",
+            variables["id"].as_str().unwrap_or("project/repository")
+        );
+        self.transport.graphql(query, variables).map_err(|error| {
+            let message = format!("{error:#}");
+            let context = if ["FORBIDDEN", "HTTP status 403", "HTTP status 404"].iter().any(|s| message.contains(s)) {
+                format!("{context}\nFine-grained token needs {permission}; an organization can also hold a fine-grained token pending approval.")
+            } else {
+                context
+            };
+            error.context(context)
+        })
+    }
+}
+
 // Shared across every connection and per-item read in one snapshot. Exhaustion
 // returns an error, never a partial snapshot that could yield proposals.
 const SNAPSHOT_REQUEST_LIMIT: usize = 1_000;
@@ -329,8 +523,13 @@ impl<T: Transport> Forge for GitHub<T> {
 
     fn snapshot(&self) -> Result<Snapshot> {
         ensure!(self.number > 0, "project number must be positive");
-        let transport = ReadBudget {
+        let diagnostic = DiagnosticTransport {
             transport: &self.transport,
+            project: format!("{}/{}", self.owner, self.number),
+            repository: String::new(),
+        };
+        let transport = ReadBudget {
+            transport: &diagnostic,
             remaining: std::cell::Cell::new(SNAPSHOT_REQUEST_LIMIT),
         };
         let data = transport.graphql("query($owner:String!,$number:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$number){id url}} ... on User{projectV2(number:$number){id url}}}}", json!({"owner":self.owner,"number":self.number}))?;
