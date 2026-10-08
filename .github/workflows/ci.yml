@@ -22,3 +22,4 @@ jobs:
       # The CLI against the fixture, as a user would run it.
       - run: cargo run --locked -q -p agent-board -- item list --snapshot fixtures/board.json
       - run: cargo run --locked -q -p agent-board -- reconcile plan --snapshot fixtures/board.json --emit
+      - run: cargo run --locked -q -p agent-board -- project view --snapshot fixtures/board.json --json project,coverage

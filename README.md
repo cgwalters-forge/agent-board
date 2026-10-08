@@ -29,11 +29,29 @@ extension.
 
 ## State
 
-Early. What exists is the model, one rule, and an offline CLI that reads
-a snapshot file. Nothing here talks to a forge yet except the
-`test project` lifecycle used by the live tests, which run from
+Early. Three pure drift rules produce preview-only plans. The CLI reads
+offline snapshots or GitHub Projects v2 through GraphQL. Use
+`snapshot create --owner OWNER --project NUMBER > board.json`,
+`project view`, `item list`, `item view`, or `reconcile plan` with those
+same flags. `--snapshot FILE` remains credential-free and offline.
+Live reads use `GH_TOKEN`, falling back to `GITHUB_TOKEN`; missing or
+rejected authentication exits with code 4. Schema, fields, issue/PR facts
+and completeness are retained; incomplete coverage blocks repairs and
+incomplete item fields block that item's repairs. PRs are read, never
+proposed for issue mutations.
+
+`test project --owner cgwalters-forge-stage --repo cgwalters-forge-stage/board-test`
+creates a random project and scratch issue, sets a field, reads the snapshot,
+checks a reconciliation plan, closes the issue and deletes only the project
+ID returned by its own create call. Cleanup is attempted after failures;
+process termination or ambiguous creation responses require manual recovery.
+Sweeping remains disabled. The workflow template in `live/board-test.yml` is
+for installation in `.github/workflows/` in
 [cgwalters-forge-stage/board-test](https://github.com/cgwalters-forge-stage/board-test)
-against throwaway projects in that organization.
+and builds only agent-board's trusted `main`, with the environment `Main`'s
+`PAT` secret. No live execution has been performed here. Only that lane can
+prove GitHub's actual schema compatibility, token access, fine-grained
+Organization Projects create/delete support, and real write/readback/cleanup.
 
 [docs/design.md](docs/design.md) has the design and the steps planned.
 Agents run through [agentic-job](https://github.com/cgwalters-forge/agentic-job).

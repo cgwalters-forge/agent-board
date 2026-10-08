@@ -26,8 +26,12 @@ struct Cli {
     jq: Option<String>,
     #[arg(short = 'R', long, global = true)]
     repo: Option<String>,
-    #[arg(long, global = true, default_value = "github.com")]
+    #[arg(long, global = true, default_value = board_forge::github::DEFAULT_HOST)]
     hostname: String,
+    #[arg(long, global = true, conflicts_with = "snapshot")]
+    owner: Option<String>,
+    #[arg(long, global = true, conflicts_with = "snapshot")]
+    project: Option<u64>,
     #[arg(long, global = true)]
     template: Option<String>,
     #[command(subcommand)]
@@ -171,6 +175,25 @@ fn main() {
 }
 
 fn load(cli: &Cli) -> Result<Snapshot> {
+    if cli.snapshot.is_none() {
+        use board_forge::Forge;
+        ensure!(
+            cli.hostname == board_forge::github::DEFAULT_HOST,
+            "unsupported GitHub host"
+        );
+        let owner = cli.owner.clone().context("live reads require --owner")?;
+        let number = cli.project.context("live reads require --project")?;
+        let snapshot = board_forge::github::GitHub {
+            transport: board_forge::github::Client::from_env()?,
+            owner,
+            number,
+        }
+        .snapshot()?;
+        if !snapshot.coverage.complete {
+            eprintln!("Warning: snapshot coverage is incomplete; reconciliation is blocked.");
+        }
+        return Ok(snapshot);
+    }
     let path = cli
         .snapshot
         .as_ref()
@@ -189,6 +212,12 @@ fn execute(cli: Cli) -> Result<()> {
         "unsupported_capability: --template is not implemented"
     );
     match &cli.command {
+        Command::Snapshot {
+            command: SnapshotCommand::Create,
+        }
+        | Command::Project {
+            command: Project::View,
+        } => render(serde_json::to_value(load(&cli)?)?, &cli),
         Command::Item {
             command: Item::List(args),
         } => {
@@ -295,7 +324,7 @@ fn execute(cli: Cli) -> Result<()> {
             command: Test::Project(options),
         } => {
             ensure!(cli.snapshot.is_none(), "live fixture cannot use --snapshot");
-            live::run(options)
+            live::run(options, cli.owner.as_deref(), cli.repo.as_deref())
         }
         _ => bail!("unsupported_capability: command not implemented in step 1"),
     }
@@ -317,7 +346,13 @@ fn item_json(item: &board_core::Item) -> Result<Value> {
     let mut value = serde_json::to_value(item)?;
     value["number"] = item.identity.number.into();
     value["repository"] = item.identity.repository.clone().into();
-    value["url"] = board_forge::github_item_url(&item.identity)?.into();
+    let url = board_forge::github_item_url(&item.identity)?;
+    value["url"] = if item.content_kind == "pull_request" {
+        url.replace("/issues/", "/pull/")
+    } else {
+        url
+    }
+    .into();
     Ok(value)
 }
 
@@ -360,9 +395,23 @@ fn render(mut value: Value, cli: &Cli) -> Result<()> {
                 "number",
                 "repository",
                 "url",
+                "content_kind",
+                "labels",
+                "assignees",
+                "timestamps",
+                "fields",
             ]
         } else {
-            &["schema", "project", "actions", "diagnostics"]
+            &[
+                "schema",
+                "project",
+                "actions",
+                "diagnostics",
+                "clock",
+                "coverage",
+                "items",
+                "fields",
+            ]
         };
         for field in fields.split(',') {
             ensure!(

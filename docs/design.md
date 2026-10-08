@@ -209,7 +209,10 @@ Offline fixtures cover pagination, redacted/null nodes, permissions, rate limits
 
 The workspace currently implements offline snapshots, missing-status and
 issue/status terminal-drift rules, preview-only GitHub proposal lowering, and
-immediate staging fixture create/read/delete. It does not complete step 1's protected workflow, scheduled
+paginated GitHub schema/membership/issue/PR reads, live read commands, and a staging
+fixture that seeds an issue and text field, reads a snapshot and plans drift before
+cleanup. `live/board-test.yml` supplies the protected staging workflow template.
+It does not complete step 1's scheduled
 sweeper or pinned agentic-job caller requirements. No live execution or pinned
 external handler/bounds contract has been verified here.
 
@@ -221,7 +224,8 @@ the observed status and issue state are captured as preconditions. Incomplete
 snapshot coverage blocks all repairs; incomplete item fields block that item's
 repairs. Closed issues are classified before the missing-status rule, avoiding
 an intermediate Triage proposal. No live reads or live terminal repair have
-been verified.
+been verified against GitHub. Recorded responses exercise the lifecycle and its
+failure cleanup without credentials.
 
 `test project --sweep` fails before authentication or network access. Editable
 project descriptions and completed Actions runs cannot prove who created a
@@ -238,8 +242,8 @@ null for an observed unset value; omission is a schema error, not null. Evidence
 may be omitted and defaults to an empty list. Unknown schema versions are rejected
 by validation. This is a deliberately strict input policy, not forward-compatible
 field discovery. GitHub issue/project URL grammar belongs to board-forge; core
-validates only generic identities and canonical HTTPS project URLs. The CLI
-supplies the default GitHub hostname.
+validates only generic identities and canonical HTTPS project URLs. The GitHub
+adapter supplies the default hostname.
 
 Use three crates: board-core for domain types, versioned snapshots/plans, pure rules and budget arithmetic; board-forge for GitHub reads, capability discovery and safe-output lowering; agent-board for CLI, orchestration and the Rust integration-fixture driver. Keep skills, schemas, fixtures and rule tables in normal repository directories. No shell program longer than ten lines. Nontrivial fixture logic belongs in Rust; a small standard-library Node wrapper may call pinned gh-aw handlers without duplicating their sanitization.
 

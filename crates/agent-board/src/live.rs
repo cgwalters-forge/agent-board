@@ -1,42 +1,23 @@
-//! Explicitly privileged staging fixture; not available through a board adapter.
+//! Opt-in staging fixture. Only locally held creation IDs authorize cleanup.
 use anyhow::{Context, Result, bail, ensure};
+use board_core::{Capability, Policy, Status};
+use board_forge::{
+    Forge,
+    github::{AuthenticationRequired, Client, GitHub, Transport},
+};
 use clap::Args;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use time::OffsetDateTime;
 
-const OWNER: &str = "cgwalters-forge-stage";
-const MARKER: &str = "agent-board-fixture/v1\n";
-const READ: &str = "query($id:ID!){node(id:$id){... on ProjectV2{id title url readme createdAt owner{... on Organization{login}}}}}";
 const DELETE: &str =
     "mutation($id:ID!){deleteProjectV2(input:{projectId:$id}){deletedProjectV2Id}}";
+const CLOSE: &str = "mutation($id:ID!){closeIssue(input:{issueId:$id}){issue{id state}}}";
 
 #[derive(Args)]
 pub struct Options {
-    #[arg(long)]
-    organization: String,
-    #[arg(long, value_name = "OWNER/REPO")]
-    scratch_repository: String,
-    #[arg(long, default_value = "agent-board-ci-")]
-    name_prefix: String,
-    /// Reserved for sweeping with independently trusted creation receipts (not implemented).
+    /// Sweeping remains disabled: names and descriptions cannot authorize deletion.
     #[arg(long)]
     sweep: bool,
 }
-
-#[derive(Debug)]
-pub struct AuthenticationRequired;
-
-impl std::fmt::Display for AuthenticationRequired {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "authentication required: provide a valid GH_TOKEN or GITHUB_TOKEN in the protected live environment"
-        )
-    }
-}
-
-impl std::error::Error for AuthenticationRequired {}
 
 pub fn error_exit_code(error: &anyhow::Error) -> i32 {
     if error.downcast_ref::<AuthenticationRequired>().is_some() {
@@ -46,408 +27,281 @@ pub fn error_exit_code(error: &anyhow::Error) -> i32 {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Receipt {
-    owner: String,
-    repository: String,
-    prefix: String,
-    nonce: String,
-    run_id: u64,
-    attempt: u32,
-    created: i64,
-}
-
-trait Transport {
-    fn graphql(&mut self, query: &str, variables: Value) -> Result<Value>;
-}
-
-fn classify_transport_error(error: ureq::Error) -> anyhow::Error {
-    match error {
-        ureq::Error::StatusCode(401) => AuthenticationRequired.into(),
-        ureq::Error::StatusCode(403) => anyhow::anyhow!(
-            "GitHub denied the request (HTTP 403): check Organization Projects read/write and repository Issues read/write permissions on the staging token, organization approval, and rate limits"
-        ),
-        // Do not include server bodies, request headers or arbitrary transport text.
-        ureq::Error::StatusCode(status) => {
-            anyhow::anyhow!("GitHub HTTP request failed (status {status})")
-        }
-        _ => anyhow::anyhow!("GitHub transport failed"),
-    }
-}
-
-struct GitHub {
-    token: String,
-    agent: ureq::Agent,
-}
-
-impl Transport for GitHub {
-    fn graphql(&mut self, query: &str, variables: Value) -> Result<Value> {
-        let response: Value = self
-            .agent
-            .post("https://api.github.com/graphql")
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .header("User-Agent", "agent-board-fixture")
-            .send_json(json!({"query":query,"variables":variables}))
-            .map_err(classify_transport_error)
-            .context("GitHub GraphQL request failed")?
-            .body_mut()
-            .read_json()
-            .context("decode GraphQL response")?;
-        // Do not echo server errors, which can contain arbitrary input.
-        ensure!(
-            response.get("errors").is_none(),
-            "GitHub returned GraphQL errors; fixture state may be ambiguous"
-        );
-        response
-            .get("data")
-            .cloned()
-            .context("missing GraphQL data")
-    }
-}
-
-fn validate_options(options: &Options) -> Result<()> {
+pub fn run(options: &Options, owner: Option<&str>, repo: Option<&str>) -> Result<()> {
     ensure!(
-        options.organization == OWNER,
-        "live fixtures are restricted to {OWNER}"
+        !options.sweep,
+        "unsupported_capability: sweeping requires independently trusted creation receipts; use manual recovery"
     );
-    let parts: Vec<_> = options.scratch_repository.split('/').collect();
+    let owner = owner.context("test project requires --owner")?;
+    let repo = repo.context("test project requires --repo OWNER/REPO")?;
     ensure!(
-        parts.len() == 2
-            && parts[0] == OWNER
-            && !parts[1].is_empty()
-            && parts[1]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)),
-        "scratch repository must belong to staging organization"
+        owner == "cgwalters-forge-stage",
+        "live fixture owner must be cgwalters-forge-stage"
     );
+    let (repo_owner, name) = repo.split_once('/').context("expected OWNER/REPO")?;
     ensure!(
-        options.name_prefix.starts_with("agent-board-ci-")
-            && options.name_prefix.len() <= 64
-            && options
-                .name_prefix
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
-        "name prefix must start with agent-board-ci- and contain only ASCII letters, numbers and hyphens"
-    );
-    Ok(())
-}
-
-pub fn run(options: &Options) -> Result<()> {
-    validate_options(options)?;
-    if options.sweep {
-        return sweep();
-    }
-    let token = select_token(
-        std::env::var("GH_TOKEN").ok(),
-        std::env::var("GITHUB_TOKEN").ok(),
-    )?;
-    let mut transport = GitHub {
-        token,
-        agent: ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(30)))
-            .build()
-            .into(),
-    };
-    let now = OffsetDateTime::now_utc().unix_timestamp();
-    ensure!(
-        std::env::var("GITHUB_REPOSITORY").ok().as_deref()
-            == Some(options.scratch_repository.as_str()),
-        "GITHUB_REPOSITORY must match the scratch repository for run provenance"
+        repo_owner == owner && !name.is_empty() && !name.contains('/'),
+        "scratch repository must belong to the staging owner"
     );
     let mut bytes = [0; 16];
     getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("generate fixture nonce"))?;
-    let nonce = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let receipt = Receipt {
-        owner: options.organization.clone(),
-        repository: options.scratch_repository.clone(),
-        prefix: options.name_prefix.clone(),
-        nonce,
-        run_id: std::env::var("GITHUB_RUN_ID")
-            .context("GITHUB_RUN_ID required for cleanup provenance")?
-            .parse()?,
-        attempt: std::env::var("GITHUB_RUN_ATTEMPT")
-            .context("GITHUB_RUN_ATTEMPT required")?
-            .parse()?,
-        created: now,
-    };
-    lifecycle(&mut transport, options, &receipt)
+    let title = format!(
+        "agent-board-ci-{}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    lifecycle(&Client::from_env()?, owner, repo, &title)
 }
 
-fn select_token(gh_token: Option<String>, github_token: Option<String>) -> Result<String> {
-    gh_token
-        .filter(|token| !token.is_empty())
-        .or_else(|| github_token.filter(|token| !token.is_empty()))
-        .ok_or_else(|| AuthenticationRequired.into())
+fn string(value: &Value, pointer: &str) -> Result<String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("missing fixture response {pointer}; mutation may be ambiguous"))
 }
 
-fn title(receipt: &Receipt) -> String {
-    format!(
-        "{}{}-{}-{}",
-        receipt.prefix, receipt.run_id, receipt.attempt, receipt.nonce
-    )
-}
-
-fn description(receipt: &Receipt) -> Result<String> {
-    Ok(format!("{MARKER}{}", serde_json::to_string(receipt)?))
-}
-
-fn verify(project: &Value, id: &str, receipt: &Receipt, options: &Options) -> Result<()> {
-    validate_options(options)?;
+fn lifecycle(t: &impl Transport, owner: &str, repo: &str, title: &str) -> Result<()> {
+    let (_, name) = repo.split_once('/').context("expected OWNER/REPO")?;
+    let scope = t.graphql("query($owner:String!,$repo:String!){organization(login:$owner){id} repository(owner:$owner,name:$repo){id nameWithOwner}}", json!({"owner":owner,"repo":name}))?;
     ensure!(
-        receipt.owner == options.organization
-            && receipt.repository == options.scratch_repository
-            && receipt.prefix == options.name_prefix,
-        "fixture provenance scope mismatch"
+        scope["repository"]["nameWithOwner"].as_str() == Some(repo),
+        "scratch repository identity mismatch"
     );
-    ensure!(
-        receipt.nonce.len() == 32
-            && receipt.nonce.chars().all(|c| c.is_ascii_hexdigit())
-            && receipt.run_id > 0
-            && receipt.attempt > 0,
-        "invalid fixture nonce/run provenance"
-    );
-    ensure!(
-        project["id"].as_str() == Some(id) && !id.is_empty(),
-        "project identity mismatch"
-    );
-    ensure!(
-        project["owner"]["login"].as_str() == Some(OWNER),
-        "project owner mismatch"
-    );
-    ensure!(
-        project["title"].as_str() == Some(title(receipt).as_str()),
-        "project name/nonce mismatch"
-    );
-    ensure!(
-        project["readme"].as_str() == Some(description(receipt)?.as_str()),
-        "project provenance mismatch"
-    );
-    let url = project["url"].as_str().context("missing project URL")?;
-    let number = url
-        .strip_prefix(&format!("https://github.com/orgs/{OWNER}/projects/"))
-        .context("project URL owner mismatch")?;
-    ensure!(
-        number.parse::<u64>().is_ok_and(|n| n > 0),
-        "invalid project URL"
-    );
-    let created = OffsetDateTime::parse(
-        project["createdAt"]
-            .as_str()
-            .context("missing creation time")?,
-        &time::format_description::well_known::Rfc3339,
-    )?
-    .unix_timestamp();
-    ensure!(
-        created.abs_diff(receipt.created) <= 300,
-        "fixture creation timestamp mismatch"
-    );
-    Ok(())
-}
-
-fn cleanup(t: &mut impl Transport, id: &str, receipt: &Receipt, options: &Options) -> Result<()> {
-    let project = t.graphql(READ, json!({"id":id}))?;
-    verify(&project["node"], id, receipt, options)?;
-    let deleted = t.graphql(DELETE, json!({"id":id}))?;
-    ensure!(
-        deleted["deleteProjectV2"]["deletedProjectV2Id"].as_str() == Some(id),
-        "delete receipt mismatch"
-    );
-    let after = t.graphql(READ, json!({"id":id}))?;
-    ensure!(
-        after.get("node").is_some_and(Value::is_null),
-        "project deletion not confirmed"
-    );
-    Ok(())
-}
-
-fn lifecycle(t: &mut impl Transport, options: &Options, receipt: &Receipt) -> Result<()> {
-    let owner = t.graphql("query($owner:String!,$repo:String!){organization(login:$owner){id} repository(owner:$owner,name:$repo){nameWithOwner}}", json!({"owner":options.organization,"repo":options.scratch_repository.split('/').nth(1)}))?;
-    ensure!(
-        owner["repository"]["nameWithOwner"].as_str() == Some(options.scratch_repository.as_str()),
-        "scratch repository not readable"
-    );
-    let owner_id = owner["organization"]["id"]
-        .as_str()
-        .context("missing staging organization ID")?;
-    let created = t.graphql("mutation($owner:ID!,$title:String!){createProjectV2(input:{ownerId:$owner,title:$title}){projectV2{id}}}", json!({"owner":owner_id,"title":title(receipt)}))?;
-    let id = created["createProjectV2"]["projectV2"]["id"]
-        .as_str()
-        .context("missing created project ID; creation may be ambiguous")?;
-    // Record the ID immediately. A crash before provenance is installed needs manual recovery,
-    // not prefix-only deletion by the sweeper.
-    println!("Created staging fixture {id}; installing cleanup provenance.");
+    let organization = string(&scope, "/organization/id")?;
+    let repository = string(&scope, "/repository/id")?;
+    let created = t.graphql("mutation($owner:ID!,$title:String!){createProjectV2(input:{ownerId:$owner,title:$title}){projectV2{id number}}}", json!({"owner":organization,"title":title}))
+        .context("create staging project: the token needs Organization Projects read/write permission; fine-grained token support must be verified live")?;
+    let project_id = string(&created, "/createProjectV2/projectV2/id")?;
+    eprintln!("Created fixture project {project_id}; cleanup uses only this in-memory ID.");
+    let mut issue_id = None;
     let result = (|| -> Result<()> {
-        t.graphql("mutation($id:ID!,$description:String!){updateProjectV2(input:{projectId:$id,readme:$description}){projectV2{id}}}", json!({"id":id,"description":description(receipt)?}))?;
-        let read = t.graphql(READ, json!({"id":id}))?;
-        verify(&read["node"], id, receipt, options)
-    })();
-    let cleanup_result = cleanup(t, id, receipt, options);
-    match (result, cleanup_result) {
-        (Ok(()), Ok(())) => {
-            println!("Fixture create/read/delete verified.");
-            Ok(())
+        let number = created["createProjectV2"]["projectV2"]["number"]
+            .as_u64()
+            .context("missing created project number")?;
+        let issue = t.graphql("mutation($repo:ID!,$title:String!){createIssue(input:{repositoryId:$repo,title:$title,body:\"Disposable agent-board live fixture\"}){issue{id number}}}", json!({"repo":repository,"title":title}))?;
+        issue_id = Some(string(&issue, "/createIssue/issue/id")?);
+        eprintln!(
+            "Created scratch issue {}; cleanup will close it.",
+            issue_id.as_deref().context("missing local issue ID")?
+        );
+        let issue_number = issue["createIssue"]["issue"]["number"]
+            .as_u64()
+            .context("missing created issue number")?;
+        let added = t.graphql("mutation($project:ID!,$issue:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$issue}){item{id}}}", json!({"project":project_id,"issue":issue_id}))?;
+        let item_id = string(&added, "/addProjectV2ItemById/item/id")?;
+        let field = t.graphql("mutation($project:ID!){createProjectV2Field(input:{projectId:$project,dataType:TEXT,name:\"Fixture nonce\"}){projectV2Field{... on ProjectV2Field{id}}}}", json!({"project":project_id}))?;
+        let field_id = string(&field, "/createProjectV2Field/projectV2Field/id")?;
+        t.graphql("mutation($project:ID!,$item:ID!,$field:ID!,$text:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{text:$text}}){projectV2Item{id}}}", json!({"project":project_id,"item":item_id,"field":field_id,"text":title}))?;
+        struct Borrowed<'a, T>(&'a T);
+        impl<T: Transport> Transport for Borrowed<'_, T> {
+            fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+                self.0.graphql(query, variables)
+            }
         }
-        (Err(error), Ok(())) => Err(error.context("fixture failed; cleanup succeeded")),
-        (result, Err(error)) => bail!(
-            "cleanup failed for recorded project {id}: {error:#}; fixture result: {}",
-            if result.is_ok() { "passed" } else { "failed" }
-        ),
+        let snapshot = GitHub {
+            transport: Borrowed(t),
+            owner: owner.into(),
+            number,
+        }
+        .snapshot()?;
+        ensure!(
+            snapshot.coverage.complete && snapshot.items.len() == 1,
+            "live snapshot did not return complete fixture membership"
+        );
+        let item = &snapshot.items[0];
+        ensure!(
+            item.identity.repository == repo
+                && item.identity.number == issue_number
+                && item.title == title
+                && item.state == "open"
+                && item.fields_complete
+                && item.content_kind == "issue",
+            "live issue readback mismatch"
+        );
+        ensure!(
+            item.fields
+                .get("Fixture nonce")
+                .and_then(|v| v["text"].as_str())
+                == Some(title),
+            "live field readback mismatch"
+        );
+        ensure!(
+            snapshot
+                .fields
+                .iter()
+                .any(|f| f["name"].as_str() == Some("Fixture nonce")),
+            "live schema readback mismatch"
+        );
+        ensure!(
+            item.labels.is_empty()
+                && item.assignees.is_empty()
+                && item.timestamps.contains_key("createdAt")
+                && item.timestamps.contains_key("updatedAt"),
+            "live issue facts mismatch"
+        );
+        let policy = Policy {
+            project: snapshot.project.clone(),
+            repositories: vec![repo.into()],
+            capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
+        };
+        let plan = board_core::reconcile(&snapshot, &policy, &snapshot.clock)?;
+        ensure!(
+            plan.actions.len() == 1
+                && matches!(
+                    plan.actions[0].intent,
+                    board_core::Intent::SetStatus {
+                        value: Status::Triage,
+                        ..
+                    }
+                ),
+            "live reconcile plan mismatch"
+        );
+        Ok(())
+    })();
+    // Attempt both cleanups even if either fails. Never read a project name or marker
+    // to decide what can be deleted; the ID comes only from this create response.
+    let close = if let Some(id) = &issue_id {
+        t.graphql(CLOSE, json!({"id":id})).and_then(|v| {
+            ensure!(
+                v["closeIssue"]["issue"]["id"].as_str() == Some(id)
+                    && v["closeIssue"]["issue"]["state"] == "CLOSED",
+                "issue cleanup receipt mismatch"
+            );
+            Ok(())
+        })
+    } else {
+        Ok(())
+    };
+    let delete = t.graphql(DELETE, json!({"id":project_id})).and_then(|v| {
+        ensure!(
+            v["deleteProjectV2"]["deletedProjectV2Id"].as_str() == Some(&project_id),
+            "project cleanup receipt mismatch"
+        );
+        Ok(())
+    });
+    if close.is_err() || delete.is_err() {
+        bail!(
+            "fixture cleanup failed; manual recovery: project {project_id}, issue {}; issue cleanup: {}; project cleanup: {}; fixture: {}",
+            issue_id.as_deref().unwrap_or("not created or ambiguous"),
+            close
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "ok".into()),
+            delete
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "ok".into()),
+            result
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "ok".into())
+        );
     }
-}
-
-fn sweep() -> Result<()> {
-    // The editable project README and a completed run do not authenticate creation.
-    // No trusted receipt backend exists yet. Refuse before even constructing a
-    // credential-bearing client, rather than expose a self-attested deletion path.
-    bail!(
-        "unsupported_capability: sweeping requires independently trusted creation receipts binding project ID, nonce, run/attempt and approved workflow identity; use manual recovery"
-    )
+    result.context("live fixture failed; cleanup succeeded")?;
+    println!(
+        "Fixture schema, membership, issue facts, field, reconcile plan and cleanup verified."
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::cell::RefCell;
 
     struct Recorded {
-        responses: VecDeque<Value>,
-        deletes: usize,
+        calls: RefCell<Vec<String>>,
+        fail: usize,
     }
 
     impl Transport for Recorded {
-        fn graphql(&mut self, query: &str, _: Value) -> Result<Value> {
-            if query == DELETE {
-                self.deletes += 1;
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            let mut calls = self.calls.borrow_mut();
+            calls.push(query.into());
+            if calls.len() == self.fail {
+                bail!("recorded failure");
             }
-            self.responses.pop_front().context("unexpected request")
-        }
-    }
-
-    fn fixture() -> (Options, Receipt, Value) {
-        let options = Options {
-            organization: OWNER.into(),
-            scratch_repository: format!("{OWNER}/board-test"),
-            name_prefix: "agent-board-ci-".into(),
-            sweep: false,
-        };
-        let receipt = Receipt {
-            owner: OWNER.into(),
-            repository: options.scratch_repository.clone(),
-            prefix: options.name_prefix.clone(),
-            nonce: "0123456789abcdef0123456789abcdef".into(),
-            run_id: 123,
-            attempt: 1,
-            created: 0,
-        };
-        let project = json!({"id":"P_fixture","title":title(&receipt),"url":format!("https://github.com/orgs/{OWNER}/projects/1"),"readme":description(&receipt).unwrap(),"owner":{"login":OWNER},"createdAt":"1970-01-01T00:00:00Z"});
-        (options, receipt, project)
-    }
-
-    #[test]
-    fn cleanup_refusal_table() {
-        let (options, receipt, project) = fixture();
-        for (field, value) in [
-            ("id", json!("wrong")),
-            ("owner", json!({"login":"cgwalters-forge"})),
-            ("title", json!("agent-board-ci-forged")),
-            ("readme", json!("copied marker")),
-            (
-                "url",
-                json!("https://github.com/orgs/cgwalters-forge/projects/1"),
-            ),
-            ("createdAt", json!("2026-10-08T00:00:00Z")),
-        ] {
-            let mut changed = project.clone();
-            changed[field] = value;
-            let mut transport = Recorded {
-                responses: vec![json!({"node":changed})].into(),
-                deletes: 0,
+            if query == DELETE {
+                assert_eq!(variables["id"], "P_created");
+                return Ok(json!({"deleteProjectV2":{"deletedProjectV2Id":"P_created"}}));
+            }
+            if query == CLOSE {
+                assert_eq!(variables["id"], "I_created");
+                return Ok(json!({"closeIssue":{"issue":{"id":"I_created","state":"CLOSED"}}}));
+            }
+            if query.contains("organization(login") {
+                return Ok(
+                    json!({"organization":{"id":"O_stage"},"repository":{"id":"R_scratch","nameWithOwner":"cgwalters-forge-stage/board-test"}}),
+                );
+            }
+            if query.contains("createProjectV2(") {
+                return Ok(json!({"createProjectV2":{"projectV2":{"id":"P_created","number":1}}}));
+            }
+            if query.contains("createIssue(") {
+                return Ok(json!({"createIssue":{"issue":{"id":"I_created","number":1}}}));
+            }
+            if query.contains("addProjectV2ItemById(") {
+                return Ok(json!({"addProjectV2ItemById":{"item":{"id":"M_created"}}}));
+            }
+            if query.contains("createProjectV2Field(") {
+                return Ok(json!({"createProjectV2Field":{"projectV2Field":{"id":"F_created"}}}));
+            }
+            if query.contains("updateProjectV2ItemFieldValue(") {
+                return Ok(
+                    json!({"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"M_created"}}}),
+                );
+            }
+            if query.contains("repositoryOwner(") {
+                return Ok(
+                    json!({"repositoryOwner":{"projectV2":{"id":"P_created","url":"https://github.com/orgs/cgwalters-forge-stage/projects/1"}}}),
+                );
+            }
+            let (key, nodes) = if query.contains("fields(first") {
+                (
+                    "fields",
+                    json!([{"id":"F_created","name":"Fixture nonce","dataType":"TEXT"},{"id":"F_status","name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"todo","name":"Todo"}]}]),
+                )
+            } else if query.contains("items(first") {
+                (
+                    "items",
+                    json!([{"id":"M_created","content":{"__typename":"Issue","id":"I_created","number":1,"title":"nonce","state":"OPEN","createdAt":"2026-10-08T00:00:00Z","updatedAt":"2026-10-08T00:00:00Z","closedAt":null,"repository":{"nameWithOwner":"cgwalters-forge-stage/board-test"}}}]),
+                )
+            } else if query.contains("fieldValues(first") {
+                (
+                    "fieldValues",
+                    json!([{"__typename":"ProjectV2ItemFieldTextValue","text":"nonce","field":{"name":"Fixture nonce"}}]),
+                )
+            } else if query.contains("labels(first") {
+                ("labels", json!([]))
+            } else {
+                ("assignees", json!([]))
             };
-            assert!(cleanup(&mut transport, "P_fixture", &receipt, &options).is_err());
-            assert_eq!(transport.deletes, 0);
+            Ok(
+                json!({"node":{key:{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
+            )
         }
     }
 
     #[test]
-    fn recorded_lifecycle() {
-        let (options, receipt, project) = fixture();
-        let mut transport = Recorded { responses: vec![
-            json!({"organization":{"id":"O_stage"},"repository":{"nameWithOwner":options.scratch_repository}}),
-            json!({"createProjectV2":{"projectV2":{"id":"P_fixture"}}}),
-            json!({"updateProjectV2":{"projectV2":{"id":"P_fixture"}}}),
-            json!({"node":project}), json!({"node":project}),
-            json!({"deleteProjectV2":{"deletedProjectV2Id":"P_fixture"}}), json!({"node":null}),
-        ].into(), deletes: 0 };
-        lifecycle(&mut transport, &options, &receipt).unwrap();
-        assert_eq!(transport.deletes, 1);
-        assert!(transport.responses.is_empty());
-    }
-
-    #[test]
-    fn fully_forged_receipt_cannot_authorize_sweeping() {
-        let (mut options, receipt, mut project) = fixture();
-        project["id"] = "P_nonfixture".into();
-        // This forged object passes all of the old self-attestation checks,
-        // including a valid nonce, timestamp and real-looking run identity.
-        verify(&project, "P_nonfixture", &receipt, &options).unwrap();
-        let decoded: Receipt = serde_json::from_str(
-            project["readme"]
-                .as_str()
-                .unwrap()
-                .strip_prefix(MARKER)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(decoded.run_id, 123);
-        options.sweep = true;
-        // No token, network, run-status lookup or delete is reachable in this mode.
-        assert!(
-            run(&options)
-                .unwrap_err()
-                .to_string()
-                .contains("independently trusted creation receipts")
-        );
-    }
-
-    #[test]
-    fn extreme_timestamp_and_scope_refused() {
-        let (mut options, mut receipt, mut project) = fixture();
-        receipt.created = i64::MIN;
-        project["readme"] = description(&receipt).unwrap().into();
-        assert!(verify(&project, "P_fixture", &receipt, &options).is_err());
-        options.organization = "cgwalters-forge".into();
-        assert!(validate_options(&options).is_err());
-    }
-
-    #[test]
-    fn http_authentication_table() {
-        for (status, authentication) in [(401, true), (403, false), (429, false), (500, false)] {
-            let error =
-                classify_transport_error(ureq::Error::StatusCode(status)).context("request failed");
-            assert_eq!(
-                error.downcast_ref::<AuthenticationRequired>().is_some(),
-                authentication
+    fn lifecycle_failure_table() {
+        for fail in 0..=15 {
+            let t = Recorded {
+                calls: RefCell::new(vec![]),
+                fail,
+            };
+            let result = lifecycle(
+                &t,
+                "cgwalters-forge-stage",
+                "cgwalters-forge-stage/board-test",
+                "nonce",
             );
-            assert_eq!(error_exit_code(&error), if authentication { 4 } else { 1 });
-            assert!(!format!("{error:#}").contains("response body"));
-        }
-    }
-
-    #[test]
-    fn token_precedence_table() {
-        for (gh, github, expected) in [
-            (Some("primary"), Some("fallback"), Some("primary")),
-            (Some(""), Some("fallback"), Some("fallback")),
-            (None, Some("fallback"), Some("fallback")),
-            (Some("primary"), None, Some("primary")),
-            (Some(""), Some(""), None),
-            (None, None, None),
-        ] {
-            let result = select_token(gh.map(str::to_owned), github.map(str::to_owned));
-            match expected {
-                Some(value) => assert_eq!(result.unwrap(), value),
-                None => assert_eq!(error_exit_code(&result.unwrap_err()), 4),
+            assert_eq!(result.is_ok(), fail == 0 || fail > 14, "failure at {fail}");
+            let calls = t.calls.borrow();
+            if fail != 1 && fail != 2 {
+                assert!(calls.iter().any(|q| q == DELETE));
+            }
+            if fail == 0 || fail >= 4 {
+                assert!(calls.iter().any(|q| q == CLOSE));
             }
         }
     }

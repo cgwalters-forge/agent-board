@@ -148,6 +148,16 @@ pub struct Item {
     pub fields_complete: bool,
     #[serde(default)]
     pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub content_kind: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub assignees: Vec<String>,
+    #[serde(default)]
+    pub timestamps: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    pub fields: BTreeMap<String, serde_json::Value>,
 }
 
 // A missing field is unknown input, not an observed null. Using a custom
@@ -168,6 +178,8 @@ pub struct Snapshot {
     pub clock: String,
     pub coverage: Coverage,
     pub items: Vec<Item>,
+    #[serde(default)]
+    pub fields: Vec<serde_json::Value>,
 }
 
 impl Snapshot {
@@ -292,6 +304,9 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
         return Ok(plan);
     }
     for item in &snapshot.items {
+        if item.content_kind == "pull_request" {
+            continue;
+        }
         if !item.fields_complete {
             plan.diagnostics.insert(
                 item.identity.display(),
