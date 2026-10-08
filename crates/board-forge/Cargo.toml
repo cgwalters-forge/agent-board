@@ -1,0 +1,10 @@
+[package]
+name = "board-forge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+board-core = { path = "../board-core" }
+serde_json.workspace = true

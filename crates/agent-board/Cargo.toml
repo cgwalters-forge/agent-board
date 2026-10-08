@@ -1,0 +1,32 @@
+[package]
+name = "agent-board"
+default-run = "agent-board"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agent-board"
+path = "src/main.rs"
+
+[[bin]]
+name = "gh-agent-board"
+path = "src/extension.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+board-core = { path = "../board-core" }
+board-forge = { path = "../board-forge" }
+clap = { version = "4", features = ["derive"] }
+jaq-interpret = "1.5"
+jaq-parse = "1"
+jaq-core = "1"
+jaq-std = "1"
+ureq = { version = "3", features = ["json"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+getrandom = "0.3"
+
+[dev-dependencies]
+assert_cmd = "2"
