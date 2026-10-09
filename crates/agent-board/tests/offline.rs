@@ -10,6 +10,34 @@ fn fixture() -> String {
 }
 
 #[test]
+fn dispatch_preview_cli_refuses_ineligible_items_and_profiles() {
+    for extra in [vec![], vec!["--kind", "review"], vec!["--json", "argv"]] {
+        command()
+            .args([
+                "request",
+                "dispatch",
+                "--item",
+                "example/intake#1",
+                "--caller",
+                "example/runners",
+                "--snapshot",
+                &fixture(),
+            ])
+            .args(extra)
+            .assert()
+            .code(1);
+    }
+    command()
+        .args(["request", "dispatch", "--help"])
+        .assert()
+        .success();
+    command()
+        .args(["run", "record", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn offline_table() {
     for (args, expected) in [
         (

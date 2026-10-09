@@ -81,9 +81,46 @@ Release publication and that distribution repository remain to be set up.
 it), up to `--limit` (30 by default). `project view` summarizes item counts by
 status and the available Status, Priority and Turn fields/options; use
 `--json project,coverage,items,fields` for machine-readable snapshot data.
-Unsupported mutation, ask, run, request and output commands are hidden from
+Unsupported mutation, ask and output commands are hidden from
 help. For manual changes meanwhile, use `gh project item-add`,
 `gh project item-edit`, and `gh issue create`/`gh issue close`.
+
+### One item, one dispatch (preview)
+
+`request dispatch` prints JSON containing a `gh workflow run` argv array for
+agentic-job's existing [dispatch caller](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md).
+Copy that caller and its bounds file into the runner repository following its
+setup checklist. The operator must approve and execute the printed command.
+This CLI does **not** launch or claim a run.
+
+```sh
+agent-board request dispatch --owner my-org --project 7 \
+  --item my-org/repo#5 --caller my-org/runners --kind implement
+# Verify the Actions run belongs to this issue before proposing its recording:
+agent-board run record --owner my-org --project 7 --item my-org/repo#5 \
+  --run https://github.com/my-org/runners/actions/runs/123
+# Once apply has actually created the result (not merely proposed it):
+agent-board run record --owner my-org --project 7 --item my-org/repo#5 \
+  --run https://github.com/my-org/runners/actions/runs/123 \
+  --result https://github.com/my-org/repo/pull/8
+```
+
+Dispatch requires complete coverage, an open issue, Status Todo, Turn Coordinator
+and no existing Run. `--kind triage` and `--kind research` select comment-only
+profiles. The task points to the issue and asks the agent to read it; the upstream
+caller checks the issue but does not embed its title/body. Output is argv, **not**
+a shell command or a dispatch safe output. No item prose is used as routing.
+
+`run record` emits an **unapplied** `update_project` proposal: Run, Status In
+Progress and Turn Worker, or with a result, Result, Status In Review and Turn
+Operator. It accepts a PR in the target repository or a comment on the target
+issue. These grammar checks do not authenticate a result or correlate a run.
+Only open Todo/In Progress items are accepted; a different Run is not overwritten.
+No proposal marks work Done or closes an issue.
+
+This is an offline join, not automatic dispatch/write-back. No new credential,
+workflow or data store is introduced. See the
+[remaining integration seam](docs/design.md#dispatch-preview-integration-seam).
 
 ## What it checks
 
