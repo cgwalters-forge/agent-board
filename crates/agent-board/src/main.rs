@@ -18,21 +18,28 @@ use std::{
     about = "Typed board snapshots and preview-only proposals"
 )]
 struct Cli {
+    /// Read an offline board snapshot instead of GitHub.
     #[arg(long, global = true)]
     snapshot: Option<PathBuf>,
+    /// Print selected comma-separated JSON fields.
     #[arg(long, global = true, value_name = "FIELDS")]
     json: Option<String>,
+    /// Filter JSON output with a jq expression.
     #[arg(long, global = true, requires = "json")]
     jq: Option<String>,
+    /// Repository OWNER/REPO for filtering or bare item numbers.
     #[arg(short = 'R', long, global = true)]
     repo: Option<String>,
+    /// GitHub hostname (only github.com is supported for live reads).
     #[arg(long, global = true, default_value = board_forge::github::DEFAULT_HOST)]
     hostname: String,
+    /// Organization or user owning the live project.
     #[arg(long, global = true, conflicts_with = "snapshot")]
     owner: Option<String>,
+    /// Live project number, not its node ID.
     #[arg(long, global = true, conflicts_with = "snapshot")]
     project: Option<u64>,
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     template: Option<String>,
     #[command(subcommand)]
     command: Command,
@@ -40,38 +47,47 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect a project's summary and schema.
     Project {
         #[command(subcommand)]
         command: Project,
     },
+    /// List or inspect board items.
     Item {
         #[command(subcommand)]
         command: Item,
     },
+    #[command(hide = true)]
     Ask {
         #[command(subcommand)]
         command: Ask,
     },
+    #[command(hide = true)]
     Run {
         #[command(subcommand)]
         command: Run,
     },
+    #[command(hide = true)]
     Request {
         #[command(subcommand)]
         command: Request,
     },
+    /// Save a normalized board snapshot for offline use.
     Snapshot {
         #[command(subcommand)]
         command: SnapshotCommand,
     },
+    /// Preview deterministic board repairs; never apply them.
     Reconcile {
         #[command(subcommand)]
         command: Reconcile,
     },
+    #[command(hide = true)]
     Output {
         #[command(subcommand)]
         command: Output,
     },
+    /// Run the credential-bearing staging integration test.
     Test {
         #[command(subcommand)]
         command: Test,
@@ -80,30 +96,43 @@ enum Command {
 
 #[derive(Subcommand)]
 enum Project {
+    /// Show item counts and available fields (use --json for snapshot data).
     View,
+    #[command(hide = true)]
     Init,
 }
 
 #[derive(Subcommand)]
 enum Item {
+    /// List board items, including closed issues by default.
     List(List),
+    /// Inspect an item by URL, OWNER/REPO#N, or N with --repo.
     View { item: String },
+    #[command(hide = true)]
     Add { url: String },
+    #[command(hide = true)]
     Create,
+    #[command(hide = true)]
     Edit { item: String },
+    #[command(hide = true)]
     Close { item: String },
 }
 
 #[derive(Args)]
 struct List {
+    /// Filter by exact board status (for example "In Progress").
     #[arg(long)]
     status: Option<String>,
+    /// Filter by priority: P0, P1 or P2.
     #[arg(long)]
     priority: Option<String>,
+    /// Filter by whose turn it is (for example Coordinator).
     #[arg(long)]
     turn: Option<String>,
-    #[arg(long, default_value = "open")]
+    /// Filter issue state: open, closed or all.
+    #[arg(long, default_value = "all")]
     state: String,
+    /// Maximum number of items to display.
     #[arg(short = 'L', long, default_value_t = 30)]
     limit: usize,
 }
@@ -137,12 +166,15 @@ enum Request {
 
 #[derive(Subcommand)]
 enum SnapshotCommand {
+    /// Write the complete normalized snapshot as JSON to stdout.
     Create,
 }
 
 #[derive(Subcommand)]
 enum Reconcile {
+    /// Propose repairs from a live board or offline snapshot.
     Plan {
+        /// Write safe-output proposals as JSONL, not authorized mutations.
         #[arg(long)]
         emit: bool,
     },
@@ -156,6 +188,7 @@ enum Output {
 
 #[derive(Subcommand)]
 enum Test {
+    /// Create and clean up scratch objects in the staging project (writes).
     Project(live::Options),
 }
 
@@ -214,10 +247,17 @@ fn execute(cli: Cli) -> Result<()> {
     match &cli.command {
         Command::Snapshot {
             command: SnapshotCommand::Create,
-        }
-        | Command::Project {
-            command: Project::View,
         } => render(serde_json::to_value(load(&cli)?)?, &cli),
+        Command::Project {
+            command: Project::View,
+        } => {
+            let snapshot = load(&cli)?;
+            if cli.json.is_some() {
+                render(serde_json::to_value(snapshot)?, &cli)
+            } else {
+                project_summary(&snapshot)
+            }
+        }
         Command::Item {
             command: Item::List(args),
         } => {
@@ -331,8 +371,57 @@ fn execute(cli: Cli) -> Result<()> {
                 cli.project,
             )
         }
-        _ => bail!("unsupported_capability: command not implemented in step 1"),
+        _ => bail!(
+            "unsupported_capability: command is not implemented; use gh project item-add, gh project item-edit, gh issue create or gh issue close for manual changes; agent-board only reads and proposes repairs"
+        ),
     }
+}
+
+fn project_summary(snapshot: &Snapshot) -> Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "Project: {}", snapshot.project)?;
+    writeln!(out, "Items: {}", snapshot.items.len())?;
+    writeln!(
+        out,
+        "Coverage: {} (observed {})",
+        if snapshot.coverage.complete {
+            "complete"
+        } else {
+            "incomplete"
+        },
+        snapshot.coverage.observed_at
+    )?;
+    let mut counts = std::collections::BTreeMap::new();
+    for item in &snapshot.items {
+        *counts.entry(label(&item.status)).or_insert(0_usize) += 1;
+    }
+    writeln!(out, "STATUS\tITEMS")?;
+    for (status, count) in counts {
+        writeln!(out, "{status}\t{count}")?;
+    }
+    writeln!(out, "FIELD\tOPTIONS")?;
+    for name in ["Status", "Priority", "Turn"] {
+        let field = snapshot
+            .fields
+            .iter()
+            .find(|field| field["name"].as_str() == Some(name));
+        let description = match field {
+            None => "missing (or schema unavailable in snapshot)".to_owned(),
+            Some(field) => field["options"]
+                .as_array()
+                .filter(|options| !options.is_empty())
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| option["name"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "no single-select options".into()),
+        };
+        writeln!(out, "{name}\t{description}")?;
+    }
+    Ok(())
 }
 
 fn label<T: serde::Serialize>(value: &Option<T>) -> String {
