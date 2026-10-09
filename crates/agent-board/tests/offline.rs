@@ -317,7 +317,13 @@ fn terminal_drift_preview_and_emit() {
         .map(|action| action["reason"].as_str().unwrap())
         .collect();
     reasons.sort();
-    assert_eq!(reasons, ["closed_issue_not_done", "done_issue_open"]);
+    assert_eq!(reasons, ["closed_issue_not_done"]);
+    assert!(
+        plan["diagnostics"]["example/intake#1"]
+            .as_str()
+            .unwrap()
+            .contains("needs_review")
+    );
     let output = command()
         .args(["reconcile", "plan", "--snapshot", &fixture, "--emit"])
         .assert()
@@ -334,7 +340,6 @@ fn terminal_drift_preview_and_emit() {
     assert_eq!(
         proposals,
         [
-            serde_json::json!({"type":"close_issue", "target_repo":"example/intake", "issue_number":1}),
             serde_json::json!({"type":"update_project", "project":"https://github.com/orgs/example/projects/1", "content_type":"issue", "content_number":2, "target_repo":"example/intake", "fields":{"Status":"Done"}}),
         ]
     );

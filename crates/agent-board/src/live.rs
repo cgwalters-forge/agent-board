@@ -307,18 +307,18 @@ fn lifecycle(
             })
             .collect();
         ensure!(
-            actions.len() == 1
-                && if kept.is_some() {
-                    matches!(actions[0].intent, board_core::Intent::CloseIssue { .. })
-                } else {
-                    matches!(
+            if kept.is_some() || !snapshot.has_status_option("Triage") {
+                actions.is_empty() && plan.diagnostics.contains_key(&item.identity.display())
+            } else {
+                actions.len() == 1
+                    && matches!(
                         actions[0].intent,
                         board_core::Intent::SetStatus {
                             value: Status::Triage,
                             ..
                         }
                     )
-                },
+            },
             "live reconcile plan mismatch"
         );
         Ok(())

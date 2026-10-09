@@ -113,28 +113,31 @@ mod tests {
 
     #[test]
     fn terminal_proposal_table() {
-        for (state, status, expected) in [
-            (
-                "open",
-                Some(board_core::Status::Done),
-                json!({
-                    "type":"close_issue", "target_repo":"example/intake", "issue_number":1
-                }),
-            ),
+        for (state, status, reason, expected) in [
             (
                 "closed",
                 Some(board_core::Status::Backlog),
+                "COMPLETED",
                 json!({
                     "type":"update_project", "project":"https://github.com/orgs/example/projects/1",
                     "content_type":"issue", "content_number":1, "target_repo":"example/intake",
                     "fields":{"Status":"Done"}
                 }),
             ),
+            (
+                "closed",
+                Some(board_core::Status::Done),
+                "NOT_PLANNED",
+                json!({"type":"update_project", "project":"https://github.com/orgs/example/projects/1",
+                "content_type":"issue", "content_number":1, "target_repo":"example/intake",
+                "fields":{"Status":"Cancelled"}}),
+            ),
         ] {
             let mut snapshot: Snapshot =
                 serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
             snapshot.items.truncate(1);
             snapshot.items[0].state = state.into();
+            snapshot.items[0].state_reason = Some(reason.into());
             snapshot.items[0].status = status;
             let policy = Policy {
                 project: snapshot.project.clone(),

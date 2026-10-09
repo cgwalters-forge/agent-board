@@ -545,7 +545,7 @@ impl<T: Transport> Forge for GitHub<T> {
         )?;
         let (members, members_complete) = connection(
             &transport,
-            "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){nodes{id content{__typename ... on Issue{id number title state createdAt updatedAt closedAt repository{nameWithOwner}} ... on PullRequest{id number title state createdAt updatedAt closedAt mergedAt repository{nameWithOwner}}}} pageInfo{hasNextPage endCursor}}}}}",
+            "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){nodes{id content{__typename ... on Issue{id number title state stateReason createdAt updatedAt closedAt repository{nameWithOwner}} ... on PullRequest{id number title state createdAt updatedAt closedAt mergedAt repository{nameWithOwner}}}} pageInfo{hasNextPage endCursor}}}}}",
             json!({"id":id}),
             "/node/items",
         )?;
@@ -708,6 +708,7 @@ impl<T: Transport> Forge for GitHub<T> {
                     "closed"
                 }
                 .into(),
+                state_reason: content["stateReason"].as_str().map(str::to_owned),
                 status,
                 priority,
                 turn,
@@ -1042,17 +1043,20 @@ mod tests {
 
     #[test]
     fn issue_and_pull_request_facts_table() {
-        for (kind, state) in [
-            ("Issue", "OPEN"),
-            ("Issue", "CLOSED"),
-            ("PullRequest", "OPEN"),
-            ("PullRequest", "MERGED"),
+        for (kind, state, reason, repairs) in [
+            ("Issue", "OPEN", None, 0),
+            ("Issue", "CLOSED", None, 0),
+            ("Issue", "CLOSED", Some("COMPLETED"), 0),
+            ("Issue", "CLOSED", Some("NOT_PLANNED"), 1),
+            ("Issue", "CLOSED", Some("OTHER"), 0),
+            ("PullRequest", "OPEN", None, 0),
+            ("PullRequest", "MERGED", None, 0),
         ] {
             let conn = |name: &str, nodes: Value| json!({"node":{name:{"nodes":nodes,"pageInfo":{"hasNextPage":false}}}});
             let t = Recorded { responses: RefCell::new(vec![
                 json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
-                conn("fields",json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"done","name":"Done"}]}])),
-                conn("items",json!([{"id":"M","content":{"__typename":kind,"id":"I","number":7,"title":"recorded","state":state,"repository":{"nameWithOwner":"example/intake"},"createdAt":"2026-10-08T00:00:00Z","updatedAt":"2026-10-08T00:00:00Z","closedAt":null,"mergedAt":null}}])),
+                conn("fields",json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"done","name":"Done"},{"id":"cancelled","name":"Cancelled"}]}])),
+                conn("items",json!([{"id":"M","content":{"__typename":kind,"id":"I","number":7,"title":"recorded","state":state,"stateReason":reason,"repository":{"nameWithOwner":"example/intake"},"createdAt":"2026-10-08T00:00:00Z","updatedAt":"2026-10-08T00:00:00Z","closedAt":null,"mergedAt":null}}])),
                 conn("fieldValues",json!([{"__typename":"ProjectV2ItemFieldSingleSelectValue","name":"Done","optionId":"done","field":{"name":"Status"}}])),
                 conn("labels",json!([{"name":"bug"}])),conn("assignees",json!([{"login":"human"}])),
             ].into()),variables:RefCell::new(vec![]) };
@@ -1069,16 +1073,23 @@ mod tests {
             assert_eq!(item.labels, ["bug"]);
             assert_eq!(item.assignees, ["human"]);
             assert_eq!(item.state, if state == "OPEN" { "open" } else { "closed" });
+            assert_eq!(item.state_reason.as_deref(), reason);
             let policy = board_core::Policy {
                 project: snapshot.project.clone(),
                 repositories: vec!["example/intake".into()],
                 capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
             };
             let plan = board_core::reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
-            assert_eq!(
-                plan.actions.len(),
-                usize::from(kind == "Issue" && state == "OPEN")
-            );
+            assert_eq!(plan.actions.len(), repairs);
+            if repairs == 1 {
+                assert!(matches!(
+                    plan.actions[0].intent,
+                    board_core::Intent::SetStatus {
+                        value: board_core::Status::Cancelled,
+                        ..
+                    }
+                ));
+            }
         }
     }
 
