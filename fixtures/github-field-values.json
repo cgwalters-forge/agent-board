@@ -1,0 +1,6 @@
+[
+  {"__typename":"ProjectV2ItemFieldLabelValue","field":{"name":"Labels"},"labels":{"nodes":[{"id":"L","name":"bug"}],"pageInfo":{"hasNextPage":false}}},
+  {"__typename":"ProjectV2ItemFieldUserValue","field":{"name":"Assignees"},"users":{"nodes":[{"id":"U","login":"human"}],"pageInfo":{"hasNextPage":false}}},
+  {"__typename":"ProjectV2ItemFieldPullRequestValue","field":{"name":"Linked pull requests"},"pullRequests":{"nodes":[{"id":"PR","number":8,"url":"https://github.com/example/intake/pull/8","title":"Repair","state":"OPEN"}],"pageInfo":{"hasNextPage":false}}},
+  {"__typename":"ProjectV2ItemFieldReviewerValue","field":{"name":"Reviewers"},"reviewers":{"nodes":[{"__typename":"User","id":"U","login":"human"},{"__typename":"Team","id":"T","name":"maintainers"}],"pageInfo":{"hasNextPage":false}}}
+]
