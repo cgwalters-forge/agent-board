@@ -68,6 +68,9 @@ API details into board-core.
 
 ## Security and scope
 
+Keep it simple: the system should pass a “secure” gut check without extra machinery ([scope decision](https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-6070870618)).
+Watch what gh-aw does; share ideas and code with it and other projects where we can, citing sources ([operator decision](https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-6089335499)).
+
 Explain changes to workflows, permissions, action pins, checkout refs, token
 placement, input bounds and validation in the PR, including their effect on trust.
 PR CI's `rust` job has only `contents: read`, no staging PAT, and disables persisted
