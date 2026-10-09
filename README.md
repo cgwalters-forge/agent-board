@@ -16,14 +16,20 @@ in step with the first.
 
 ## Try it
 
-You need Rust. From a clone of this repository:
+You need Rust supporting edition 2024. No clone is needed to install:
 
 ```sh
 cargo install --git https://github.com/cgwalters-forge/agent-board agent-board
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
-Then, against the sample board in `fixtures/`:
+For the offline examples below, clone this repository and run from its root
+so the sample board in `fixtures/` is available:
+
+```sh
+git clone https://github.com/cgwalters-forge/agent-board
+cd agent-board
+```
 
 ```console
 $ agent-board item list --snapshot fixtures/board.json
@@ -42,7 +48,13 @@ proposal. These commands read a file and write to your terminal: no
 credential, no network.
 
 Against a real board you need a token that can read the project and its
-issues:
+issues. For an organization project, a classic token needs `read:project`
+(and access to the repositories being read); a fine-grained token needs the
+organization's Projects **Read** and the repositories' Issues **Read** permissions,
+plus GitHub's required Metadata read. Organization approval or SSO authorization
+may also be required. Read commands do not need `project` write scope.
+If you already use `gh`, you can explicitly reuse its authentication with
+`export GH_TOKEN="$(gh auth token)"`; there is no automatic fallback today.
 
 ```sh
 export GH_TOKEN=...
@@ -59,6 +71,19 @@ Commands and flags follow `gh`'s: nouns then verbs, `--json` with
 `--jq`, the same exit codes. The binary is also built as
 `gh-agent-board`, the name `gh` expects of an extension; it is not
 published as one yet.
+
+There are no published precompiled releases yet; Rust is currently required.
+An extension distribution needs a `gh-`-prefixed repository, so
+`gh extension install cgwalters-forge/agent-board` is not an installation path.
+Release publication and that distribution repository remain to be set up.
+
+`item list` includes open and closed issues by default (`--state open` narrows
+it), up to `--limit` (30 by default). `project view` summarizes item counts by
+status and the available Status, Priority and Turn fields/options; use
+`--json project,coverage,items,fields` for machine-readable snapshot data.
+Unsupported mutation, ask, run, request and output commands are hidden from
+help. For manual changes meanwhile, use `gh project item-add`,
+`gh project item-edit`, and `gh issue create`/`gh issue close`.
 
 ## What it checks
 
