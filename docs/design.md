@@ -216,6 +216,11 @@ It does not complete step 1's scheduled
 sweeper or pinned agentic-job caller requirements. No live execution or pinned
 external handler/bounds contract has been verified here.
 
+Label, user, linked-PR and reviewer field values are not GraphQL nodes. The reader
+fetches their nested connections inline (at most 100 entries each); additional
+pages or redacted/missing connection data mark the item and snapshot incomplete,
+blocking reconciliation rather than treating a partial list as complete.
+
 Terminal-drift plans propose closing an open issue marked Done, or setting Done
 on a closed issue (including one with no status). They do not authorize closure:
 the independent checker/applier must verify that the target is an issue and
