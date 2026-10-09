@@ -1,0 +1,41 @@
+name: staging reconciliation preview
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+# No write permission or OIDC: this stops at the agentic-job integration seam.
+permissions:
+  contents: read
+concurrency:
+  group: staging-project-2-reconcile
+  cancel-in-progress: false
+jobs:
+  propose:
+    if: github.ref == 'refs/heads/main'
+    # Configure this environment to allow only the main branch (no tags).
+    # Its read-only secret must not also exist as a repository/organization secret.
+    environment: staging-project-read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: cargo build --locked --release -p agent-board
+      - name: Read staging project
+        run: ./target/release/agent-board snapshot create --owner cgwalters-forge-stage --project 2 > snapshot.json
+        env:
+          GH_TOKEN: ${{ secrets.STAGING_PROJECT_READ_TOKEN }}
+      - name: Propose without a token
+        run: ./target/release/agent-board reconcile plan --snapshot snapshot.json --emit > proposals.jsonl
+      # Preview only. Never give this job the staging write token.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staging-reconcile-proposals
+          path: |
+            snapshot.json
+            proposals.jsonl
+            live/reconcile-bounds.json
+          if-no-files-found: error
+          retention-days: 7
