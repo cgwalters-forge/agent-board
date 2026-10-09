@@ -11,3 +11,4 @@ serde_json.workspace = true
 sha2 = "0.10"
 url = { version = "2", features = ["serde"] }
 time = { version = "0.3", features = ["parsing"] }
+toml = "0.8"

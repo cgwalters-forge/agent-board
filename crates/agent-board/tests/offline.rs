@@ -10,6 +10,166 @@ fn fixture() -> String {
 }
 
 #[test]
+fn proposal_check_cli_table() {
+    let snapshot = format!(
+        "{}/../../fixtures/assigned-board.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let valid = serde_json::json!({"type":"update_project", "project":"https://github.com/orgs/example/projects/1", "target_repo":"example/intake", "content_type":"issue", "content_number":1, "fields":{"Status":"Done"}});
+    for (identity, number, field, reason) in [
+        ("rust-worker", 1, "Status", None),
+        ("rust-worker", 2, "Status", Some("not assigned")),
+        ("rust-worker", 3, "Status", Some("not assigned")),
+        ("rust-worker", 1, "Agent", Some("never editable")),
+        ("rust-worker", 1, "agent", Some("never editable")),
+        ("rust-worker", 1, "AGENT", Some("never editable")),
+        ("rust-worker", 1, "aGeNt", Some("never editable")),
+        ("rust-worker", 3, "Agent", Some("never editable")),
+        ("rust-worker", 1, "Priority", Some("field not permitted")),
+        ("unknown", 1, "Status", Some("unknown agent identity")),
+    ] {
+        let mut output = valid.clone();
+        output["content_number"] = serde_json::json!(number);
+        output["fields"] = serde_json::json!({field:"rust-worker"});
+        let result = command()
+            .args([
+                "check",
+                "proposals",
+                "--as",
+                identity,
+                "--snapshot",
+                &snapshot,
+            ])
+            .write_stdin(format!("{output}\n"))
+            .assert();
+        if let Some(reason) = reason {
+            let output = result.code(1).get_output().clone();
+            assert!(String::from_utf8(output.stderr).unwrap().contains(reason));
+        } else {
+            result.success().stdout("");
+        }
+    }
+    for (input, reason) in [
+        (format!("{valid}\nnot json\n"), "decode proposal line 2"),
+        (
+            format!("{valid}\n{{\"type\":\"create_issue\"}}\n"),
+            "proposal line 2 refused",
+        ),
+    ] {
+        let output = command()
+            .args([
+                "check",
+                "proposals",
+                "--as",
+                "rust-worker",
+                "--snapshot",
+                &snapshot,
+            ])
+            .write_stdin(input)
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        assert!(String::from_utf8(output.stderr).unwrap().contains(reason));
+    }
+    command()
+        .args(["check", "proposals", "--as", "rust-worker"])
+        .write_stdin("")
+        .assert()
+        .code(1);
+    let output = command()
+        .args(["snapshot", "create", "--snapshot", &snapshot])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let normalized: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(normalized["items"][0]["assignment"], "rust-worker");
+    assert_eq!(normalized["items"][1]["assignment"], "board-coordinator");
+    assert!(normalized["items"][2]["assignment"].is_null());
+}
+
+#[test]
+fn custom_policy_snapshot_and_check_cli() {
+    // Honor TMPDIR, allowing sandbox runners to keep scratch files under home.
+    let directory = std::env::temp_dir().join(format!("agent-board-policy-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let policy = directory.join("agents.toml");
+    let snapshot = directory.join("board.json");
+    let proposals = directory.join("outputs.jsonl");
+    let original = include_str!("../../../fixtures/assigned-board.json")
+        .replace("rust-worker", "custom-worker");
+    std::fs::write(&snapshot, original).unwrap();
+    std::fs::write(
+        &policy,
+        board_core::DEFAULT_AGENT_POLICY.replace("rust-worker", "custom-worker"),
+    )
+    .unwrap();
+    let args = [
+        "--policy",
+        policy.to_str().unwrap(),
+        "--snapshot",
+        snapshot.to_str().unwrap(),
+    ];
+    let output = command()
+        .args(["snapshot", "create"])
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let normalized: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(normalized["items"][0]["assignment"], "custom-worker");
+    std::fs::write(&snapshot, output).unwrap();
+    std::fs::write(
+        &proposals,
+        "{\"type\":\"close_issue\",\"target_repo\":\"example/intake\",\"issue_number\":1}\n",
+    )
+    .unwrap();
+    command()
+        .args([
+            "check",
+            "proposals",
+            "--as",
+            "custom-worker",
+            "--proposals",
+            proposals.to_str().unwrap(),
+        ])
+        .args(args)
+        .assert()
+        .success();
+    std::fs::write(
+        &policy,
+        board_core::DEFAULT_AGENT_POLICY
+            .replace("rust-worker", "custom-worker")
+            .replace("enabled = true", "enabled = false"),
+    )
+    .unwrap();
+    let output = command()
+        .args([
+            "check",
+            "proposals",
+            "--as",
+            "custom-worker",
+            "--proposals",
+            proposals.to_str().unwrap(),
+        ])
+        .args(args)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("disabled agent identity")
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn dispatch_preview_cli_refuses_ineligible_items_and_profiles() {
     for extra in [vec![], vec!["--kind", "review"], vec!["--json", "argv"]] {
         command()

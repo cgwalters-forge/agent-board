@@ -16,6 +16,11 @@ in step with the first.
 
 ## Try it
 
+The identity policy in `policy/agents.toml` adds assignment- and field-level restrictions that GitHub's project write permission cannot express: `agent-board check proposals --as rust-worker --snapshot board.json --proposals outputs.jsonl` refuses a batch that edits an unassigned or peer-owned item, an unlisted field, or the Agent field itself.
+The trusted check job must choose `--as`, load policy from this repository's protected main (the compiled default or `--policy FILE`), and supply a fresh independently read snapshot; the Agent single-select edited in the UI is the assignment, assuming every project writer is trusted to assign work.
+This pure check does not authenticate the run, apply outputs, prove completion for closure, prevent assignment races, or protect against a compromised operator/applier, and adds no receipts, credentials or data store.
+It is an assignment/name gate, not complete output validation: field values are arbitrary JSON, edited fields/options need not exist in the snapshot, and the CLI reads the entire JSONL without byte or output-count limits. Independent size/count, schema, value-type and option-existence checks remain mandatory before any write integration; the applier must not implicitly create fields or coerce malformed values. Passing this check alone does not mean an output is safe to apply.
+
 You need Rust supporting edition 2024. No clone is needed to install:
 
 ```sh
