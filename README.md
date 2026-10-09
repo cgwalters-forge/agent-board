@@ -142,6 +142,81 @@ that organisation only. Its
 were refused by GitHub because the token there cannot yet reach the
 project, so it has not passed.
 
+### Scheduled deterministic staging preview
+
+[reconcile.yml](.github/workflows/reconcile.yml) runs every ten minutes and
+by hand, only on `main`. It builds this repository at the triggering commit,
+reads **cgwalters-forge-stage project 2**, and runs `reconcile plan --emit`
+offline. Its artifact contains the snapshot, proposals and
+[proposed bounds](live/reconcile-bounds.json): only `update_project` (3) and
+`close_issue` (2), at most 5 total, on that project and
+`cgwalters-forge-stage/board-test`. There is no model, sandbox setup or apply
+job. These are preview proposals, not checked or authorized writes: a live
+snapshot may contain other repositories or exceed those caps.
+
+Before enabling the preview, create the dedicated `staging-project-read`
+environment here. Set its deployment branches and tags to **Selected branches
+and tags**, with only a **branch** rule for `main` and no tag rules. Do not use
+“Protected branches only”: that can admit other protected branches. Keep changes
+to this environment's protection and secrets restricted to trusted administrators.
+Provision `STAGING_PROJECT_READ_TOKEN` only as a secret of that environment, with
+organization Projects **Read** and repository Issues **Read** on the staging
+repository (plus GitHub's required Metadata read). It is a separate read-only
+token, not the staging write PAT. Remove any repository or organization secret
+of the same name accessible to this repository, so a branch workflow cannot
+bypass the environment by omitting `environment`. If previously provisioned
+as a repository secret, revoke it and provision a new read-only token in the
+environment. This preview environment must contain no write credentials.
+Before eventual live apply, cgwalters must set the staging **apply**
+token's organization Projects permission to **Read and write**. No write token
+is needed or used for this preview.
+
+The integration seam is upstream. On 2026-10-08, agentic-job's public
+[workflow docs](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/workflow.md)
+and [safe-output docs](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/safe-outputs.md)
+describe only policy → agent → check → apply: there is no reusable entry point
+for a proposals artifact from a non-agent job. They also list only
+`create_pull_request`, `create_issue`, `add_comment`, `noop`, `missing_tool`
+and `missing_data`, not either repair type. Calling it with a fake agent would
+not close this gap and would add the sandbox machinery we do not need.
+
+The small upstream workflow change is a proposals-only reusable entry point:
+accept an artifact from the current caller run, construct an analysis/no-patch
+hand-back and policy from trusted caller bounds, then reuse the independent
+collector/check and apply jobs, skipping agent/activate/notify/conclude.
+Only apply should receive the staging write secret. Separately, upstream must
+add `update_project` and `close_issue` to its bounds parser, collector
+configuration, checker and handler routing: exact project URL, explicit
+repository allowlist and per-type/total counts, with issue-only targets and no
+implicit comment writes. Pin the resulting reviewed workflow commit before
+wiring it here. `live/reconcile-bounds.json` is a proposed profile, **not an
+accepted agentic-job bounds format**; adapt it to that upstream contract rather
+than teaching this CLI a second applier.
+
+`cargo test -p agent-board --test reconcile_seam --locked` feeds the staging
+snapshot fixture through the real CLI, checks both proposal types against that
+profile using a test-only oracle, and refuses another project, the production
+project, an unlisted repository, a third type, and excessive per-type/total
+counts. This does not exercise gh-aw or agentic-job's independent checker.
+Incomplete snapshots already emit nothing, covered by the existing tests.
+
+Workflow trust details: `permissions: contents: read` is only for fetching
+this public source; there is no write permission or `id-token`. The checkout
+action is pinned to v4.2.2's commit and upload-artifact to v4.6.2's commit,
+preventing a mutable action tag from changing code that runs in the reader job.
+`ref: github.sha` builds the workflow's own commit, not a later branch tip;
+`persist-credentials: false` keeps the checkout token out of git configuration.
+The explicit `GH_TOKEN` environment is confined to the snapshot step so the
+build and offline planner do not receive the read credential. No write secret
+is named anywhere. The job references `staging-project-read`; GitHub's separately
+configured environment branch restriction, not the branch-editable main-only
+`if`, prevents arbitrary branch code from receiving the read secret. The `if`
+only skips unnecessary runs. This boundary requires the provisioning above;
+the workflow cannot create or verify environment protection or token permissions.
+These controls protect the credential-bearing
+reader and future apply boundary, not a nonexistent credential-free agent.
+Concurrency avoids overlapping staging scans; it is not a durable queue.
+
 Not built: the job that applies proposals, agent runs for triage and
 reporting, asks to the operator, budgets, and any forge but GitHub.
 [docs/design.md](docs/design.md) has the design and the order things

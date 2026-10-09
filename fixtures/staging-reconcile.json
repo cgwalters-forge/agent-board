@@ -1,0 +1,11 @@
+{
+  "schema": "board-snapshot/v1",
+  "project": "https://github.com/orgs/cgwalters-forge-stage/projects/2",
+  "clock": "2026-10-08T00:00:00Z",
+  "coverage": {"complete": true, "observed_at": "2026-10-08T00:00:00Z"},
+  "items": [
+    {"identity":{"host":"github.com","repository":"cgwalters-forge-stage/board-test","number":1},"content_kind":"issue","title":"Missing status","state":"open","status":null,"priority":"P2","turn":"Coordinator","fields_complete":true},
+    {"identity":{"host":"github.com","repository":"cgwalters-forge-stage/board-test","number":2},"content_kind":"issue","title":"Done but open","state":"open","status":"Done","priority":"P2","turn":"None","fields_complete":true},
+    {"identity":{"host":"github.com","repository":"cgwalters-forge-stage/board-test","number":3},"content_kind":"issue","title":"Closed but not done","state":"closed","status":"Triage","priority":"P2","turn":"Coordinator","fields_complete":true}
+  ]
+}
