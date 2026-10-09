@@ -53,7 +53,7 @@ fn staging_proposals_and_bounds_contract() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(proposals.len(), 3);
+    assert_eq!(proposals.len(), 2);
     assert_eq!(
         proposals
             .iter()
@@ -66,7 +66,7 @@ fn staging_proposals_and_bounds_contract() {
             .iter()
             .filter(|p| p["type"] == "close_issue")
             .count(),
-        1
+        0
     );
     assert!(fits_bounds(&proposals, &bounds));
 
@@ -96,7 +96,11 @@ fn staging_proposals_and_bounds_contract() {
         assert!(!fits_bounds(&invalid, &bounds), "{name}");
     }
     for (kind, count) in [("update_project", 4), ("close_issue", 3)] {
-        let proposal = proposals.iter().find(|p| p["type"] == kind).unwrap();
+        let fallback = json!({"type":"close_issue","target_repo":"cgwalters-forge-stage/board-test","issue_number":2});
+        let proposal = proposals
+            .iter()
+            .find(|p| p["type"] == kind)
+            .unwrap_or(&fallback);
         assert!(
             !fits_bounds(&vec![proposal.clone(); count], &bounds),
             "{kind} cap"

@@ -221,11 +221,15 @@ fetches their nested connections inline (at most 100 entries each); additional
 pages or redacted/missing connection data mark the item and snapshot incomplete,
 blocking reconciliation rather than treating a partial list as complete.
 
-Terminal-drift plans propose closing an open issue marked Done, or setting Done
-on a closed issue (including one with no status). They do not authorize closure:
+Terminal-drift plans leave Done/open issues for review, never proposing closure
+from Status alone, so a person's reopen is not undone. Closed issues get Done
+only for `COMPLETED`, Cancelled for `NOT_PLANNED`; an unknown reason blocks repair.
+Every target status must exist unambiguously in the snapshot schema. The plans
+do not authorize writes:
 the independent checker/applier must verify that the target is an issue and
 that authenticated completion evidence exists, as required in section 4. Both
-the observed status and issue state are captured as preconditions. Incomplete
+the observed status and issue state, plus the closure reason, are captured as
+preconditions. Incomplete
 snapshot coverage blocks all repairs; incomplete item fields block that item's
 repairs. Closed issues are classified before the missing-status rule, avoiding
 an intermediate Triage proposal. No live reads or live terminal repair have

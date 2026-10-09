@@ -128,8 +128,27 @@ Three rules today, each a plain function from a snapshot to a list of
 proposals, so the same board always gives the same answer:
 
 - an item with no status gets a proposed `Triage`;
-- an item marked done whose issue is still open: close the issue;
-- an issue closed while its item is not done: mark it done.
+- an item marked Done whose issue is still open: ask for review, never propose
+  closing it from Status alone (a person may have just reopened it);
+- a closed issue: propose Done for `COMPLETED`, Cancelled for `NOT_PLANNED`.
+
+GitHub's built-in project workflows overlap these checks: “Item added to
+project” supplies Todo, “Item closed” and “Pull request merged” supply Done,
+and “Auto-close issue” closes an issue when its Status becomes Done. When enabled,
+these often leave nothing to repair. agent-board adds a dry-run review for boards
+where automation is off or older boards have drifted, and a deterministic plan
+with reasons and preconditions; it is not a second automatic closer. Future
+evidence-based rules will join more than one fact. The historical counts below
+are not representative of a new board with built-in automation enabled.
+
+Every proposed Status must exist in the snapshot's single-select schema; missing,
+duplicate or unavailable options produce diagnostics instead of impossible writes.
+`project view` reports missing design statuses and fields, not a requirement to
+replace a default board's Todo/In Progress/Done schema. Provision fields manually;
+`project init` is not implemented. Built-in workflow settings are not read by the
+API adapter: check them in project settings. Closed issues with unknown closure
+reason are left for review. Done/open items are also left for review regardless of
+event order: no reopen timeline or accepted-completion authority is inferred.
 
 They only act on items positively known to be issues, and if the
 snapshot is incomplete, because a page failed to load, they propose
@@ -256,7 +275,7 @@ accepted agentic-job bounds format**; adapt it to that upstream contract rather
 than teaching this CLI a second applier.
 
 `cargo test -p agent-board --test reconcile_seam --locked` feeds the staging
-snapshot fixture through the real CLI, checks both proposal types against that
+snapshot fixture through the real CLI, checks status repairs against that
 profile using a test-only oracle, and refuses another project, the production
 project, an unlisted repository, a third type, and excessive per-type/total
 counts. This does not exercise gh-aw or agentic-job's independent checker.

@@ -370,6 +370,9 @@ fn execute(cli: Cli) -> Result<()> {
             let plan = board_core::reconcile(&snapshot, &policy, &snapshot.clock)?;
             if *emit {
                 ensure!(cli.json.is_none(), "--emit cannot be combined with --json");
+                for (target, diagnostic) in &plan.diagnostics {
+                    eprintln!("{target}: {diagnostic}");
+                }
                 let mut out = io::stdout().lock();
                 for output in GitHubSafeOutputs.lower(&plan)? {
                     serde_json::to_writer(&mut out, &output)?;
@@ -445,6 +448,26 @@ fn project_summary(snapshot: &Snapshot) -> Result<()> {
         };
         writeln!(out, "{name}\t{description}")?;
     }
+    writeln!(
+        out,
+        "Built-in workflows: not observed; check project settings for overlapping automation"
+    )?;
+    for option in [
+        "Triage",
+        "Backlog",
+        "Todo",
+        "In Progress",
+        "Draft",
+        "In Review",
+        "Blocked",
+        "Done",
+        "Cancelled",
+    ] {
+        let available = snapshot.has_status_option(option);
+        if !available {
+            writeln!(out, "Schema drift: Status has no option {option}")?;
+        }
+    }
     Ok(())
 }
 
@@ -505,6 +528,7 @@ fn render(mut value: Value, cli: &Cli) -> Result<()> {
                 "identity",
                 "title",
                 "state",
+                "state_reason",
                 "status",
                 "priority",
                 "turn",
