@@ -288,12 +288,12 @@ evidence of authorship or success. The operator must verify run/item correlation
 and applied results; independent apply must re-read state and validate proposals.
 An editable snapshot is never write authority.
 
-Remaining upstream changes are specific: the dispatch target preflight should
-export the fetched issue title/body as bounded, fenced task data, and the caller
+The dispatch target preflight now embeds the fetched issue title/body as task
+data, and upstream supports update_project proposals. Remaining integration: the caller
 should expose applied PR/comment URLs and refusal reasons as trusted reusable
 workflow outputs, with run identity/attempt. This allows a post-run controller to
 correlate results without parsing model prose or choosing the latest run by title.
-agentic-job must also support independently bounded `update_project` application
+Independently bounded `update_project` application must be configured
 for the exact project, issue, fields and values. Only that separate apply job may
 receive organization Projects write permission; GITHUB_TOKEN does not grant it.
 

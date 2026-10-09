@@ -101,22 +101,36 @@ agent-board run record --owner my-org --project 7 --item my-org/repo#5 \
   --run https://github.com/my-org/runners/actions/runs/123
 # Once apply has actually created the result (not merely proposed it):
 agent-board run record --owner my-org --project 7 --item my-org/repo#5 \
-  --run https://github.com/my-org/runners/actions/runs/123 \
   --result https://github.com/my-org/repo/pull/8
 ```
 
 Dispatch requires complete coverage, an open issue, Status Todo, Turn Coordinator
 and no existing Run. `--kind triage` and `--kind research` select comment-only
-profiles. The task points to the issue and asks the agent to read it; the upstream
-caller checks the issue but does not embed its title/body. Output is argv, **not**
+profiles. The task points to the issue and uses the title/body embedded by the
+upstream caller as task data. Output is argv, **not**
 a shell command or a dispatch safe output. No item prose is used as routing.
 
 `run record` emits an **unapplied** `update_project` proposal: Run, Status In
-Progress and Turn Worker, or with a result, Result, Status In Review and Turn
-Operator. It accepts a PR in the target repository or a comment on the target
+Progress and Turn Worker, or with a result, Result, Status In Review (In Progress
+on a default board without In Review) and Turn Operator. Omit `--run` to reuse
+the item's Run field; an unset Run still requires an explicit verified URL.
+It accepts a PR in the target repository or a comment on the target
 issue. These grammar checks do not authenticate a result or correlate a run.
 Only open Todo/In Progress items are accepted; a different Run is not overwritten.
 No proposal marks work Done or closes an issue.
+
+Before dispatch, provision these fields (replace OWNER and NUMBER):
+
+```sh
+gh project field-create NUMBER --owner OWNER --name Turn --data-type SINGLE_SELECT --single-select-options Coordinator,Worker,Operator,External,None
+gh project field-create NUMBER --owner OWNER --name Run --data-type TEXT
+gh project field-create NUMBER --owner OWNER --name Result --data-type TEXT
+```
+
+Set the item's Turn to Coordinator using the project UI. Dispatch and recording
+check the schema before proposing writes and report missing fields/options.
+Todo and In Progress are required Status options; In Review and the design's
+other statuses are optional for this join. Provisioning is not automatic.
 
 This is an offline join, not automatic dispatch/write-back. No new credential,
 workflow or data store is introduced. See the
@@ -252,25 +266,18 @@ Before eventual live apply, cgwalters must set the staging **apply**
 token's organization Projects permission to **Read and write**. No write token
 is needed or used for this preview.
 
-The integration seam is upstream. On 2026-10-08, agentic-job's public
+The integration seam uses agentic-job's public
 [workflow docs](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/workflow.md)
 and [safe-output docs](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/safe-outputs.md)
-describe only policy → agent → check → apply: there is no reusable entry point
-for a proposals artifact from a non-agent job. They also list only
-`create_pull_request`, `create_issue`, `add_comment`, `noop`, `missing_tool`
-and `missing_data`, not either repair type. Calling it with a fake agent would
-not close this gap and would add the sandbox machinery we do not need.
+now describe a proposals-only reusable entry point and support `update_project`
+and `close_issue`. This repository's scheduled preview has not yet been wired
+to that entry point; upstream support is not evidence of configured apply here.
 
-The small upstream workflow change is a proposals-only reusable entry point:
-accept an artifact from the current caller run, construct an analysis/no-patch
-hand-back and policy from trusted caller bounds, then reuse the independent
-collector/check and apply jobs, skipping agent/activate/notify/conclude.
-Only apply should receive the staging write secret. Separately, upstream must
-add `update_project` and `close_issue` to its bounds parser, collector
-configuration, checker and handler routing: exact project URL, explicit
-repository allowlist and per-type/total counts, with issue-only targets and no
-implicit comment writes. Pin the resulting reviewed workflow commit before
-wiring it here. `live/reconcile-bounds.json` is a proposed profile, **not an
+Integration should accept an artifact from the current caller run and reuse
+the independent check/apply jobs without a fake agent. Only apply should receive
+the staging write secret. Pin a reviewed compatible upstream workflow commit
+before wiring it here, with exact project/repository bounds and per-type/total
+counts. `live/reconcile-bounds.json` remains a proposed profile, **not an
 accepted agentic-job bounds format**; adapt it to that upstream contract rather
 than teaching this CLI a second applier.
 
