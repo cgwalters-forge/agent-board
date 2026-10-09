@@ -1,0 +1,29 @@
+{
+  "schema": "board-snapshot/v1",
+  "project": "https://github.com/orgs/example/projects/1",
+  "clock": "2026-10-08T00:00:00Z",
+  "coverage": {"complete": true, "observed_at": "2026-10-08T00:00:00Z"},
+  "fields": [{"name": "Agent", "dataType": "SINGLE_SELECT", "options": [
+    {"id": "worker", "name": "rust-worker"},
+    {"id": "peer", "name": "board-coordinator"}
+  ]}],
+  "items": [
+    {
+      "identity": {"host": "github.com", "repository": "example/intake", "number": 1},
+      "title": "Worker task", "state": "open", "content_kind": "issue",
+      "status": null, "priority": null, "turn": null, "fields_complete": true,
+      "fields": {"Agent": {"__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "rust-worker", "optionId": "worker"}}
+    },
+    {
+      "identity": {"host": "github.com", "repository": "example/intake", "number": 2},
+      "title": "Peer task", "state": "open", "content_kind": "issue",
+      "status": null, "priority": null, "turn": null, "fields_complete": true,
+      "fields": {"Agent": {"__typename": "ProjectV2ItemFieldSingleSelectValue", "name": "board-coordinator", "optionId": "peer"}}
+    },
+    {
+      "identity": {"host": "github.com", "repository": "example/intake", "number": 3},
+      "title": "Unassigned task", "state": "open", "content_kind": "issue",
+      "status": null, "priority": null, "turn": null, "fields_complete": true
+    }
+  ]
+}

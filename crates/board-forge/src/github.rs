@@ -522,6 +522,14 @@ impl<T: Transport> Forge for GitHub<T> {
     }
 
     fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_with_policy(&board_core::AgentPolicy::parse(
+            board_core::DEFAULT_AGENT_POLICY,
+        )?)
+    }
+}
+
+impl<T: Transport> GitHub<T> {
+    pub fn snapshot_with_policy(&self, policy: &board_core::AgentPolicy) -> Result<Snapshot> {
         ensure!(self.number > 0, "project number must be positive");
         let diagnostic = DiagnosticTransport {
             transport: &self.transport,
@@ -614,6 +622,10 @@ impl<T: Transport> Forge for GitHub<T> {
                     value[field] = nodes.cloned().unwrap_or_default().into();
                 }
                 if let Some(name) = value["field"]["name"].as_str() {
+                    ensure!(
+                        name != "Agent" || !item_fields.contains_key(name),
+                        "duplicate Agent value"
+                    );
                     item_fields.insert(name.to_owned(), value);
                 } else {
                     // An unimplemented or redacted value must not become an
@@ -701,6 +713,7 @@ impl<T: Transport> Forge for GitHub<T> {
             .parse()?;
             items.push(Item {
                 identity,
+                assignment: None,
                 title: text(content, "title")?.into(),
                 state: if native_state == "OPEN" {
                     "open"
@@ -737,7 +750,7 @@ impl<T: Transport> Forge for GitHub<T> {
                 fields: item_fields,
             });
         }
-        let snapshot = Snapshot {
+        let mut snapshot = Snapshot {
             schema: board_core::SNAPSHOT_SCHEMA.into(),
             project: text(project, "url")?.parse()?,
             clock: clock.clone(),
@@ -750,6 +763,7 @@ impl<T: Transport> Forge for GitHub<T> {
         };
         validate_github_project(&snapshot.project)?;
         snapshot.validate()?;
+        policy.normalize(&mut snapshot)?;
         Ok(snapshot)
     }
 }
@@ -1089,6 +1103,48 @@ mod tests {
                         ..
                     }
                 ));
+            }
+        }
+    }
+
+    #[test]
+    fn agent_assignment_reader_table() {
+        for (name, valid) in [
+            (None, true),
+            (Some("rust-worker"), true),
+            (Some("custom-worker"), true),
+            (Some("unknown"), false),
+        ] {
+            let conn = |name: &str, nodes: Value| json!({"node":{name:{"nodes":nodes,"pageInfo":{"hasNextPage":false}}}});
+            let values = name.map(|name| vec![json!({"__typename":"ProjectV2ItemFieldSingleSelectValue", "name":name, "optionId":"agent", "field":{"name":"Agent"}})]).unwrap_or_default();
+            let github = GitHub {
+                transport: Recorded {
+                    responses: RefCell::new(vec![
+                        json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
+                        conn("fields", json!([
+                            {"name":"Status","dataType":"SINGLE_SELECT","options":[]},
+                            {"name":"Agent","dataType":"SINGLE_SELECT","options":[{"id":"agent","name":name.unwrap_or("rust-worker")}]}
+                        ])),
+                        conn("items", json!([{"id":"M","content":{"__typename":"Issue","id":"I","number":7,"title":"recorded","state":"OPEN","repository":{"nameWithOwner":"example/intake"}}}])),
+                        conn("fieldValues", json!(values)),
+                        conn("labels", json!([])),
+                        conn("assignees", json!([])),
+                    ].into()),
+                    variables: RefCell::new(vec![]),
+                },
+                owner: "example".into(),
+                number: 1,
+            };
+            let policy = board_core::AgentPolicy::parse(&format!(
+                "{}\n[agents.custom-worker]\nenabled = true\nfields = []\noutputs = []",
+                board_core::DEFAULT_AGENT_POLICY
+            ))
+            .unwrap();
+            let result = github.snapshot_with_policy(&policy);
+            if valid {
+                assert_eq!(result.unwrap().items[0].assignment.as_deref(), name);
+            } else {
+                assert!(format!("{:#}", result.unwrap_err()).contains("unknown Agent value"));
             }
         }
     }

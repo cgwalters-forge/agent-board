@@ -5,6 +5,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use url::Url;
 
+mod agents;
+pub use agents::{AgentIdentity, AgentPolicy, DEFAULT_AGENT_POLICY, check_proposals};
+
 pub const SNAPSHOT_SCHEMA: &str = "board-snapshot/v1";
 pub const PLAN_SCHEMA: &str = "board-plan/v1";
 
@@ -138,6 +141,9 @@ pub struct Coverage {
 #[serde(deny_unknown_fields)]
 pub struct Item {
     pub identity: ItemRef,
+    /// Observed Agent single-select value, not proof of run identity.
+    #[serde(default)]
+    pub assignment: Option<String>,
     pub title: String,
     pub state: String,
     #[serde(default)]

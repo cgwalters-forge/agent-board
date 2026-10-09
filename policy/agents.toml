@@ -1,0 +1,10 @@
+# Load this file from trusted main, never from a run's proposed changes.
+[agents.rust-worker]
+enabled = true
+fields = ["Status", "Result", "Next"]
+outputs = ["update_project", "close_issue"]
+
+[agents.board-coordinator]
+enabled = true
+fields = ["Status", "Turn", "Priority", "Next", "News"]
+outputs = ["update_project"]

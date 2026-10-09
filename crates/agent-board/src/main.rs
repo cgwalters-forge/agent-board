@@ -19,6 +19,9 @@ use std::{
     about = "Typed board snapshots and preview-only proposals"
 )]
 struct Cli {
+    /// Trusted identity policy; defaults to the policy compiled from this repository.
+    #[arg(long, global = true)]
+    policy: Option<PathBuf>,
     /// Read an offline board snapshot instead of GitHub.
     #[arg(long, global = true)]
     snapshot: Option<PathBuf>,
@@ -48,6 +51,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check proposals without applying them.
+    Check {
+        #[command(subcommand)]
+        command: Check,
+    },
     /// Inspect a project's summary and schema.
     Project {
         #[command(subcommand)]
@@ -193,6 +201,18 @@ enum Output {
 }
 
 #[derive(Subcommand)]
+enum Check {
+    /// Refuse outputs outside an identity's assignment and field policy.
+    Proposals {
+        #[arg(long = "as")]
+        identity: String,
+        /// JSONL proposals file; reads stdin when omitted.
+        #[arg(long)]
+        proposals: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Test {
     /// Create and clean up scratch objects in the staging project (writes).
     Project(live::Options),
@@ -213,9 +233,18 @@ fn main() {
     }
 }
 
+fn agent_policy(cli: &Cli) -> Result<board_core::AgentPolicy> {
+    let input = match &cli.policy {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("read policy {}", path.display()))?,
+        None => board_core::DEFAULT_AGENT_POLICY.to_owned(),
+    };
+    board_core::AgentPolicy::parse(&input)
+}
+
 fn load(cli: &Cli) -> Result<Snapshot> {
+    let policy = agent_policy(cli)?;
     if cli.snapshot.is_none() {
-        use board_forge::Forge;
         ensure!(
             cli.hostname == board_forge::github::DEFAULT_HOST,
             "unsupported GitHub host"
@@ -227,7 +256,7 @@ fn load(cli: &Cli) -> Result<Snapshot> {
             owner,
             number,
         }
-        .snapshot()?;
+        .snapshot_with_policy(&policy)?;
         if !snapshot.coverage.complete {
             eprintln!("Warning: snapshot coverage is incomplete; reconciliation is blocked.");
         }
@@ -237,11 +266,12 @@ fn load(cli: &Cli) -> Result<Snapshot> {
         .snapshot
         .as_ref()
         .context("--snapshot FILE is required; live board reads are not implemented")?;
-    let snapshot: Snapshot = serde_json::from_slice(
+    let mut snapshot: Snapshot = serde_json::from_slice(
         &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
     )
     .context("decode snapshot")?;
     snapshot.validate()?;
+    policy.normalize(&mut snapshot)?;
     Ok(snapshot)
 }
 
@@ -251,6 +281,41 @@ fn execute(cli: Cli) -> Result<()> {
         "unsupported_capability: --template is not implemented"
     );
     match &cli.command {
+        Command::Check {
+            command:
+                Check::Proposals {
+                    identity,
+                    proposals,
+                },
+        } => {
+            use std::io::Read;
+            ensure!(
+                cli.snapshot.is_some(),
+                "proposal checks require --snapshot FILE from a trusted reader"
+            );
+            let policy = agent_policy(&cli)?;
+            let mut input = String::new();
+            match proposals {
+                Some(path) => {
+                    input = std::fs::read_to_string(path)
+                        .with_context(|| format!("read proposals {}", path.display()))?
+                }
+                None => {
+                    io::stdin()
+                        .read_to_string(&mut input)
+                        .context("read proposals from stdin")?;
+                }
+            }
+            let outputs: Vec<Value> = input
+                .lines()
+                .enumerate()
+                .map(|(index, line)| {
+                    serde_json::from_str(line)
+                        .with_context(|| format!("decode proposal line {}", index + 1))
+                })
+                .collect::<Result<_>>()?;
+            board_core::check_proposals(&policy, identity, &load(&cli)?, &outputs)
+        }
         Command::Request {
             command: Request::Dispatch(args),
         } => {
@@ -538,6 +603,7 @@ fn render(mut value: Value, cli: &Cli) -> Result<()> {
                 "repository",
                 "url",
                 "content_kind",
+                "assignment",
                 "labels",
                 "assignees",
                 "timestamps",
