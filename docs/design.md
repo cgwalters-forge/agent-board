@@ -273,6 +273,32 @@ This sequence makes agentic-job integration a visible dependency without turning
 
 ## 8. Operator decisions
 
+### Dispatch preview integration seam
+
+`request dispatch` and `run record` implement an operator-driven preview join to
+agentic-job's `examples/dispatch/dispatch.yml`. Both support offline snapshots;
+neither mutates the forge. Routing comes from explicit operator flags, not item
+prose. Eligibility rejects incomplete or non-issue inputs to avoid launching work
+from unknown state. URL grammar excludes unrelated result targets, but is not
+evidence of authorship or success. The operator must verify run/item correlation
+and applied results; independent apply must re-read state and validate proposals.
+An editable snapshot is never write authority.
+
+Remaining upstream changes are specific: the dispatch target preflight should
+export the fetched issue title/body as bounded, fenced task data, and the caller
+should expose applied PR/comment URLs and refusal reasons as trusted reusable
+workflow outputs, with run identity/attempt. This allows a post-run controller to
+correlate results without parsing model prose or choosing the latest run by title.
+agentic-job must also support independently bounded `update_project` application
+for the exact project, issue, fields and values. Only that separate apply job may
+receive organization Projects write permission; GITHUB_TOKEN does not grant it.
+
+No scheduled admission, automatic recording, run listing, refusal-to-Blocked
+conversion or stuck-run recovery is implemented yet. Do not retry an ambiguous
+dispatch automatically. Field provisioning remains manual with `gh project
+field-create` (Run/Result are text fields). No workflow permissions, token
+placement or action pins are changed in this patch.
+
 **A — Extension distribution.** Recommend keeping source in agent-board and creating a release-only gh-agent-board distribution repository. Alternative: rename source to gh-agent-board to avoid a second release destination.
 
 **B — Initial authority and turn.** Recommend the strict four mutation types above, project Turn, operator approval before execution, and no coordinator-native assignment/comment/parent writes. Alternative: explicitly add narrowly bounded comments, two known assignees and same-owner sub-issue links after agentic-job validates them. This is an authority expansion, not an implementation detail.

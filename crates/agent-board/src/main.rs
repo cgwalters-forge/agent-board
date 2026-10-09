@@ -1,3 +1,4 @@
+mod dispatch;
 mod live;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -62,12 +63,12 @@ enum Command {
         #[command(subcommand)]
         command: Ask,
     },
-    #[command(hide = true)]
+    /// Prepare run field updates (proposals only).
     Run {
         #[command(subcommand)]
         command: Run,
     },
-    #[command(hide = true)]
+    /// Prepare an operator-approved workflow dispatch (no network writes).
     Request {
         #[command(subcommand)]
         command: Request,
@@ -148,20 +149,25 @@ enum Ask {
 
 #[derive(Subcommand)]
 enum Run {
+    #[command(hide = true)]
     List,
+    #[command(hide = true)]
     View { run: String },
+    /// Propose recording an operator-verified run and optional applied result.
+    Record(dispatch::Record),
 }
 
 #[derive(Subcommand)]
 enum Request {
+    #[command(hide = true)]
     Create {
         #[arg(long)]
         item: String,
     },
-    View {
-        issue: String,
-    },
-    Dispatch,
+    #[command(hide = true)]
+    View { issue: String },
+    /// Print gh argv for one eligible issue; does not execute it.
+    Dispatch(dispatch::Dispatch),
 }
 
 #[derive(Subcommand)]
@@ -245,6 +251,24 @@ fn execute(cli: Cli) -> Result<()> {
         "unsupported_capability: --template is not implemented"
     );
     match &cli.command {
+        Command::Request {
+            command: Request::Dispatch(args),
+        } => {
+            ensure!(
+                cli.json.is_none(),
+                "dispatch prints its own JSON command schema"
+            );
+            dispatch::prepare(&load(&cli)?, args, cli.repo.as_deref(), &cli.hostname)
+        }
+        Command::Run {
+            command: Run::Record(args),
+        } => {
+            ensure!(
+                cli.json.is_none(),
+                "record prints JSONL proposals; --json is unsupported"
+            );
+            dispatch::record(&load(&cli)?, args, cli.repo.as_deref(), &cli.hostname)
+        }
         Command::Snapshot {
             command: SnapshotCommand::Create,
         } => render(serde_json::to_value(load(&cli)?)?, &cli),
