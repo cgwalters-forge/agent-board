@@ -72,6 +72,7 @@ pub struct Actor {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BoardField {
     IssueState,
+    IssueStateReason,
     Status,
     Priority,
     Turn,
@@ -139,6 +140,8 @@ pub struct Item {
     pub identity: ItemRef,
     pub title: String,
     pub state: String,
+    #[serde(default)]
+    pub state_reason: Option<String>,
     #[serde(deserialize_with = "required_nullable")]
     pub status: Option<Status>,
     #[serde(deserialize_with = "required_nullable")]
@@ -184,6 +187,23 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub fn has_status_option(&self, name: &str) -> bool {
+        let matching: Vec<_> = self
+            .fields
+            .iter()
+            .filter(|field| field["name"] == "Status")
+            .collect();
+        matching.len() == 1
+            && matching[0]["dataType"] == "SINGLE_SELECT"
+            && matching[0]["options"].as_array().is_some_and(|options| {
+                options
+                    .iter()
+                    .filter(|option| option["name"] == name)
+                    .count()
+                    == 1
+            })
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.schema == SNAPSHOT_SCHEMA,
@@ -331,27 +351,37 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
         );
         let (reason, intent) = match (&item.status, item.state.as_str()) {
             (Some(Status::Done), "open") => {
-                if !policy.capabilities.contains(&Capability::CloseIssue) {
-                    plan.diagnostics.insert(
-                        item.identity.display(),
-                        "unsupported_capability: closing issues".into(),
-                    );
+                plan.diagnostics.insert(
+                    item.identity.display(),
+                    "needs_review: Done issue is open, possibly reopened; no closure proposed. Review completion evidence and reset Status if needed".into(),
+                );
+                continue;
+            }
+            (status, "closed") => {
+                let target = match item.state_reason.as_deref() {
+                    Some("NOT_PLANNED") => Status::Cancelled,
+                    Some("COMPLETED") => Status::Done,
+                    _ => {
+                        plan.diagnostics.insert(item.identity.display(),
+                            "missing_data: closed issue has unknown state reason; no terminal repair proposed".into());
+                        continue;
+                    }
+                };
+                if *status == Some(target.clone()) {
                     continue;
                 }
                 (
-                    "done_issue_open",
-                    Intent::CloseIssue {
+                    if target == Status::Cancelled {
+                        "closed_issue_not_cancelled"
+                    } else {
+                        "closed_issue_not_done"
+                    },
+                    Intent::SetStatus {
                         item: item.identity.clone(),
+                        value: target,
                     },
                 )
             }
-            (status, "closed") if *status != Some(Status::Done) => (
-                "closed_issue_not_done",
-                Intent::SetStatus {
-                    item: item.identity.clone(),
-                    value: Status::Done,
-                },
-            ),
             (None, "open") => (
                 "missing_status",
                 Intent::SetStatus {
@@ -361,6 +391,17 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
             ),
             _ => continue,
         };
+        if let Intent::SetStatus { value, .. } = &intent {
+            let name = serde_json::to_value(value)?;
+            let supported = name
+                .as_str()
+                .is_some_and(|name| snapshot.has_status_option(name));
+            if !supported {
+                plan.diagnostics.insert(item.identity.display(),
+                    format!("schema_drift: Status has no unambiguous single-select option {name}; no repair proposed"));
+                continue;
+            }
+        }
         let key_input = serde_json::to_vec(&(snapshot.project.as_str(), &item.identity, reason))?;
         plan.actions.push(Action {
             key: format!("{:x}", Sha256::digest(key_input)),
@@ -382,6 +423,11 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
                     field: BoardField::IssueState,
                     expected: Some(item.state.clone()),
                 },
+                Precondition {
+                    item: item.identity.clone(),
+                    field: BoardField::IssueStateReason,
+                    expected: item.state_reason.clone(),
+                },
             ],
             evidence: item.evidence.clone(),
         });
@@ -393,6 +439,90 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ambiguous_and_malformed_status_schema_table() {
+        let valid = serde_json::json!({"name":"Status","dataType":"SINGLE_SELECT","options":[{"name":"Triage"}]});
+        for fields in [
+            serde_json::json!([]),
+            serde_json::json!([valid.clone(), valid.clone()]),
+            serde_json::json!([{"name":"Status","dataType":"TEXT","options":[{"name":"Triage"}]}]),
+            serde_json::json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"name":"Triage"},{"name":"Triage"}]}]),
+            serde_json::json!([{"name":"Status","dataType":"SINGLE_SELECT","options":null}]),
+            serde_json::json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[null,{},"Triage"]}]),
+            serde_json::json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"name":"Todo"},{"name":"In Progress"},{"name":"Done"}]}]),
+        ] {
+            let mut snapshot: Snapshot =
+                serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+            snapshot.items.truncate(1);
+            snapshot.fields = serde_json::from_value(fields).unwrap();
+            let policy = Policy {
+                project: snapshot.project.clone(),
+                repositories: vec!["example/intake".into()],
+                capabilities: vec![Capability::ProjectFieldEdit],
+            };
+            assert!(!snapshot.has_status_option("Triage"));
+            let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
+            assert!(plan.actions.is_empty());
+            assert!(plan.diagnostics["example/intake#1"].contains("schema_drift"));
+        }
+    }
+
+    #[test]
+    fn schema_and_terminal_safety_table() {
+        for (state, status, reason, schema, expected) in [
+            ("open", Some(Status::Done), None, true, None),
+            ("open", None, None, false, None),
+            ("open", None, None, true, Some(Status::Triage)),
+            (
+                "closed",
+                Some(Status::Todo),
+                Some("NOT_PLANNED"),
+                true,
+                Some(Status::Cancelled),
+            ),
+            (
+                "closed",
+                Some(Status::Done),
+                Some("NOT_PLANNED"),
+                true,
+                Some(Status::Cancelled),
+            ),
+            (
+                "closed",
+                Some(Status::Todo),
+                Some("COMPLETED"),
+                true,
+                Some(Status::Done),
+            ),
+            ("closed", Some(Status::Todo), None, true, None),
+            ("closed", Some(Status::Todo), Some("OTHER"), true, None),
+        ] {
+            let mut snapshot: Snapshot =
+                serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+            snapshot.items.truncate(1);
+            snapshot.items[0].state = state.into();
+            snapshot.items[0].status = status;
+            snapshot.items[0].state_reason = reason.map(str::to_owned);
+            if !schema {
+                snapshot.fields.clear();
+            }
+            let policy = Policy {
+                project: snapshot.project.clone(),
+                repositories: vec!["example/intake".into()],
+                capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
+            };
+            let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
+            assert_eq!(plan.actions.len(), usize::from(expected.is_some()));
+            if let Some(expected) = expected {
+                assert!(
+                    matches!(&plan.actions[0].intent, Intent::SetStatus { value, .. } if *value == expected)
+                );
+            } else {
+                assert!(!plan.diagnostics.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn content_kind_table() {
@@ -422,6 +552,7 @@ mod tests {
                 snapshot.items.truncate(1);
                 snapshot.items[0].status = status;
                 snapshot.items[0].state = state.into();
+                snapshot.items[0].state_reason = Some("COMPLETED".into());
                 let policy = Policy {
                     project: snapshot.project.clone(),
                     repositories: vec!["example/intake".into()],
@@ -430,11 +561,22 @@ mod tests {
                 let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
                 assert_eq!(
                     plan.actions.len(),
-                    usize::from(kind == Some("issue")),
+                    usize::from(
+                        kind == Some("issue") && state != "open"
+                            || kind == Some("issue") && snapshot.items[0].status.is_none()
+                    ),
                     "{kind:?}/{state}"
                 );
                 let unknown = !matches!(kind, Some("issue" | "pull_request"));
-                assert_eq!(plan.diagnostics.len(), usize::from(unknown));
+                assert_eq!(
+                    plan.diagnostics.len(),
+                    usize::from(
+                        unknown
+                            || kind == Some("issue")
+                                && snapshot.items[0].status == Some(Status::Done)
+                                && state == "open"
+                    )
+                );
                 if unknown {
                     assert!(
                         plan.diagnostics[&snapshot.items[0].identity.display()]
@@ -466,13 +608,14 @@ mod tests {
                 snapshot.items.truncate(1);
                 snapshot.items[0].status = status.clone();
                 snapshot.items[0].state = state.into();
+                snapshot.items[0].state_reason = Some("COMPLETED".into());
                 let policy = Policy {
                     project: snapshot.project.clone(),
                     repositories: vec!["example/intake".into()],
                     capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
                 };
                 let expected = match (&status, state) {
-                    (Some(Status::Done), "open") => Some("done_issue_open"),
+                    (Some(Status::Done), "open") => None,
                     (status, "closed") if *status != Some(Status::Done) => {
                         Some("closed_issue_not_done")
                     }
@@ -484,7 +627,7 @@ mod tests {
                 if let Some(reason) = expected {
                     let action = &plan.actions[0];
                     assert_eq!(action.reason, reason);
-                    assert_eq!(action.prerequisites.len(), 2);
+                    assert_eq!(action.prerequisites.len(), 3);
                     assert_eq!(action.prerequisites[1].field, BoardField::IssueState);
                     assert_eq!(action.prerequisites[1].expected.as_deref(), Some(state));
                     match &action.intent {
@@ -517,6 +660,7 @@ mod tests {
                 snapshot.items.truncate(1);
                 snapshot.items[0].status = status.clone();
                 snapshot.items[0].state = state.into();
+                snapshot.items[0].state_reason = Some("COMPLETED".into());
                 let mut policy = Policy {
                     project: snapshot.project.clone(),
                     repositories: vec!["example/intake".into()],

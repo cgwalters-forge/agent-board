@@ -3,6 +3,7 @@
   "project": "https://github.com/orgs/example/projects/1",
   "clock": "2026-10-08T00:00:00Z",
   "coverage": {"complete": true, "observed_at": "2026-10-08T00:00:00Z"},
+  "fields": [{"name":"Status","dataType":"SINGLE_SELECT","options":[{"name":"Triage"},{"name":"Done"},{"name":"Cancelled"}]}],
   "items": [
     {"identity":{"host":"github.com","repository":"example/intake","number":1},"content_kind":"issue","title":"Repair missing status","state":"open","status":null,"priority":"P2","turn":"Coordinator","fields_complete":true},
     {"identity":{"host":"github.com","repository":"example/intake","number":2},"content_kind":"issue","title":"Already triaged","state":"open","status":"Triage","priority":"P1","turn":"Coordinator","fields_complete":true}
