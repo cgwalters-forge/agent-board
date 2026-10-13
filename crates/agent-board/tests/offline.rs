@@ -46,6 +46,52 @@ fn status_update_cli_refusals() {
     }
 }
 
+/// promote refuses before reading a token or GitHub; with a valid dry run and no token
+/// it stops at authentication (exit 4), having made no request.
+#[test]
+fn promote_cli_refusals() {
+    let url = "https://github.com/cgwalters-forge/proj/pull/1";
+    for (args, code, reason) in [
+        (vec!["promote", url], 1, "only runs with --dry-run"),
+        (
+            vec![
+                "promote",
+                "https://github.com/acme/proj/pull/1",
+                "--dry-run",
+            ],
+            1,
+            "expected a PR URL in one of the forks",
+        ),
+        (
+            vec!["promote", url, "--dry-run", "--snapshot", &fixture()],
+            1,
+            "--snapshot and --json are unsupported",
+        ),
+        (
+            vec!["promote", url, "--dry-run", "--hostname", "github.example"],
+            1,
+            "unsupported GitHub host",
+        ),
+        (
+            vec!["promote", url, "--dry-run"],
+            4,
+            "authentication required",
+        ),
+    ] {
+        let output = command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(args)
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(reason), "{reason}: {stderr}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
 #[test]
 fn proposal_check_cli_table() {
     let snapshot = format!(
