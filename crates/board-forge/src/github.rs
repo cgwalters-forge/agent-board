@@ -640,6 +640,15 @@ pub struct GitHub<T> {
     pub number: u64,
 }
 
+/// Comment on the issue or pull request with node id `subject`, returning the comment URL.
+pub fn add_comment(transport: &impl Transport, subject: &str, body: &str) -> Result<String> {
+    let data = transport.graphql(
+        "mutation($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{url}}}}",
+        json!({"id":subject,"body":body}),
+    )?;
+    Ok(text(&data["addComment"]["commentEdge"]["node"], "url")?.to_owned())
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
@@ -1231,11 +1240,7 @@ impl<T: Transport> GitHub<T> {
 
     /// Comment on an issue, returning the comment URL.
     pub fn comment(&self, repository: &str, issue: &str, body: &str) -> Result<String> {
-        let data = self.repository_diagnostic(repository).graphql(
-            "mutation($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{url}}}}",
-            json!({"id":issue,"body":body}),
-        )?;
-        Ok(text(&data["addComment"]["commentEdge"]["node"], "url")?.to_owned())
+        add_comment(&self.repository_diagnostic(repository), issue, body)
     }
 
     /// Close an issue as completed and check that GitHub reports it closed.

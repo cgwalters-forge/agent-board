@@ -75,7 +75,7 @@ enum Command {
         #[command(subcommand)]
         command: Ask,
     },
-    /// Check whether cgwalters' approved fork PR may go upstream (--dry-run only).
+    /// Check whether cgwalters' approved fork PR may go upstream; comment a refusal on it once.
     Promote(promote::Promote),
     /// Prepare run field updates (proposals only).
     Run {
@@ -625,7 +625,23 @@ fn execute(cli: Cli) -> Result<()> {
             );
             promote::check_args(args)?;
             let client = board_forge::github::Client::from_env()?;
-            promote::run(args, &promote::Api::new(&client), &mut io::stdout().lock())
+            let comment = |repository: &str, subject: &str, body: &str| {
+                board_forge::github::add_comment(
+                    &board_forge::github::DiagnosticTransport {
+                        transport: &client,
+                        project: String::new(),
+                        repository: repository.into(),
+                    },
+                    subject,
+                    body,
+                )
+            };
+            promote::run(
+                args,
+                &promote::Api::new(&client),
+                &comment,
+                &mut io::stdout().lock(),
+            )
         }
         Command::Test {
             command: Test::Project(options),

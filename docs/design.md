@@ -343,12 +343,18 @@ links and copying the blocked item's Priority are not implemented.
 `promote FORK_PR_URL --dry-run` ports the checks of homegit's `bot-pr promote`
 (approved current head, a current bot-ok contribution policy record in homegit, a
 stacked pull request's base merged upstream) and prints the plan, or the one refusal
-comment it would leave. It only reads, through a REST interface with no write method,
-and refuses to run without `--dry-run`; `.github/workflows/promote.yml` runs it on
-dispatch or when called with a URL. Rebasing, DCO sign-off, opening the upstream pull
-request, refusal comments and their deduplication, `/promote --human-text` and the check
-of who loosened a policy verdict are not implemented; the real promote needs an
-operator-stored `PROMOTE_TOKEN`.
+comment it would leave. Its reads go through a REST interface with no write method;
+`.github/workflows/promote.yml` runs it on dispatch or when called with a URL.
+Without `--dry-run`, a refusal is commented on the fork pull request. The comment names
+the head and the operator's verdict it answers, and is not posted while the bot's latest
+refusal comment there is the same, so a repeated run says nothing new until the head,
+the verdict or the reasons change. That is the only write: a pull request that passes
+every check then fails with `unsupported_capability`. Rebasing, DCO sign-off, opening
+the upstream pull request, `/promote --human-text` and the check of who loosened a
+policy verdict are not implemented. The workflow stays a dry run until the operator
+stores `PROMOTE_TOKEN`, which the comment needs too: issues or pull requests write on
+the forks, and the bot's own, as a comment by anyone else is refused rather than left
+unrecognised by the next run.
 
 For read-only setup, `project init --snapshot FILE` retains its field table on
 stdout and prints copyable `gh project field-create` commands for missing fields
