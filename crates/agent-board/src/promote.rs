@@ -1,15 +1,16 @@
-//! `promote FORK_PR_URL --dry-run`: check whether a fork pull request the bot opened may
+//! `promote FORK_PR_URL [--dry-run]`: check whether a fork pull request the bot opened may
 //! go upstream, and print what promoting it would do. This ports the checks of homegit's
 //! `bot-pr promote`: only the head cgwalters approved (an approving review of it, or a
 //! `/promote` comment written after it was pushed), only into a repository whose
 //! contribution policy record says bot-ok and is current, and a stacked pull request only
-//! once its base is merged upstream. Each refusal is the one comment a real promote would
-//! leave on the fork pull request.
+//! once its base is merged upstream.
 //!
-//! This is the first slice: it only reads, through `Rest`, which has no write method,
-//! and refuses to run without `--dry-run`. Rebasing, the DCO sign-off, opening the
-//! upstream pull request, commenting and the board update are not ported yet, nor are
-//! `/promote --human-text`, go-ahead hints and the check of who loosened a policy verdict.
+//! It reads through `Rest`, which has no write method. Without `--dry-run` it makes one
+//! write: a refusal becomes a comment on the fork pull request, unless the bot's latest
+//! such comment there already says the same of the same head. A pull request that passes
+//! every check is still an error then, as rebasing, the DCO sign-off, opening the upstream
+//! pull request and the board update are not ported yet, nor are `/promote --human-text`,
+//! go-ahead hints and the check of who loosened a policy verdict.
 use anyhow::{Context, Result, bail, ensure};
 use board_forge::github::Rest;
 use clap::Args;
@@ -26,6 +27,16 @@ const FORK_OWNERS: [&str; 2] = ["cgwalters-forge", BOT_LOGIN];
 const BRANCH_PREFIX: &str = "bot/";
 const META_START: &str = "<!-- bot-meta -->";
 const META_END: &str = "<!-- /bot-meta -->";
+/// Marks the bot's refusal comments, so that one is not repeated while nothing changed.
+/// It opens the comment's first line, which goes on to name the verdict that was refused.
+const REFUSAL_MARKER: &str = "<!-- agent-board promote: refusal";
+const LLMS_TRAILER: &str = "Generated-by: https://github.com/cgwalters/#llms";
+/// What a refusal comment keeps of its reasons besides ASCII letters and digits; anything
+/// else becomes `REFUSAL_REPLACEMENT`.
+const REFUSAL_PUNCTUATION: &str = " -_./:;,'\"()";
+const REFUSAL_REPLACEMENT: char = '?';
+/// How much of the head commit a refusal comment shows.
+const SHORT_SHA: usize = 12;
 const PROMOTE_COMMAND: &str = "/promote";
 /// Approves like `/promote` in homegit; its human-text checks are not ported, and a
 /// human-text policy is refused, so here it only approves.
@@ -56,19 +67,20 @@ const PAGE_LIMIT: usize = 10;
 pub struct Promote {
     /// The fork pull request: https://github.com/cgwalters-forge/REPO/pull/N.
     pub url: String,
-    /// Check everything and print what promoting would do, without changing anything (required for now).
+    /// Check everything and print what promoting would do, without changing anything.
+    /// Without it, a refusal is commented on the fork PR once; nothing else is written yet.
     #[arg(long)]
     pub dry_run: bool,
 }
 
 /// Validation that needs no token, before the client is built.
 pub fn check_args(args: &Promote) -> Result<()> {
-    ensure!(
-        args.dry_run,
-        "unsupported_capability: promote only runs with --dry-run so far; opening upstream pull requests is not implemented"
-    );
     parse_fork_url(&args.url).map(drop)
 }
+
+/// The one write of a promote so far: comment `body` on the pull request with node id
+/// `subject` in `repository`, returning the comment's URL.
+pub type Comment<'a> = &'a dyn Fn(&str, &str, &str) -> Result<String>;
 
 /// The request-counted reads of one promote.
 pub struct Api<'a, R> {
@@ -124,7 +136,12 @@ impl<'a, R: Rest> Api<'a, R> {
     }
 }
 
-pub fn run<R: Rest>(args: &Promote, api: &Api<R>, out: &mut impl Write) -> Result<()> {
+pub fn run<R: Rest>(
+    args: &Promote,
+    api: &Api<R>,
+    comment: Comment,
+    out: &mut impl Write,
+) -> Result<()> {
     check_args(args)?;
     let (fork, number) = parse_fork_url(&args.url)?;
     let url = &args.url;
@@ -312,11 +329,60 @@ pub fn run<R: Rest>(args: &Promote, api: &Api<R>, out: &mut impl Write) -> Resul
             )?;
         }
     } else {
-        writeln!(out, "Would comment on {url} and stop:")?;
+        let notice = refusal_comment(head_sha, approval.as_ref(), &refusals);
+        let said = activity.said(&notice);
+        match (said, args.dry_run) {
+            (Some(said), true) => writeln!(out, "Already said in {said}; would stop:")?,
+            (None, true) => writeln!(out, "Would comment on {url} and stop:")?,
+            (Some(said), false) => writeln!(out, "Already said in {said}:")?,
+            (None, false) => {
+                let subject = text(&pr["node_id"]);
+                ensure!(!subject.is_empty(), "{url} has no node id to comment on");
+                // A comment by anyone else would not be recognised by the next run,
+                // which would then say it again.
+                let token = api.required("user")?;
+                let login = text(&token["login"]);
+                ensure!(
+                    login == BOT_LOGIN,
+                    "the token is {login}'s, but only {BOT_LOGIN} comments refusals; nothing was commented on {url}"
+                );
+                let posted = comment(&fork, subject, &notice)
+                    .with_context(|| format!("comment the refusal on {url}"))?;
+                writeln!(out, "Commented {posted}:")?;
+            }
+        }
         writeln!(out, "Not promoted: {}.", refusals.join("; "))?;
     }
     writeln!(out, "\nTitle: {title}\n\n{upstream_body}")?;
+    // Only after the plan is printed, so that the log says what is not done yet.
+    ensure!(
+        args.dry_run || !refusals.is_empty(),
+        "unsupported_capability: {url} passes every check, but opening the upstream pull request is not implemented; nothing was changed"
+    );
     Ok(())
+}
+
+/// The comment a refusal leaves on the fork PR. It names the head and the verdict it
+/// answers, so that the same refusal of a later push or a later approval is said again.
+/// The reasons can quote names from an upstream's tree, so they are reduced to
+/// characters that neither mention anyone nor make a link, a reference or markup.
+fn refusal_comment(head_sha: &str, approval: Option<&Approval>, refusals: &[String]) -> String {
+    let reasons: String = refusals
+        .join("; ")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || REFUSAL_PUNCTUATION.contains(c) {
+                c
+            } else {
+                REFUSAL_REPLACEMENT
+            }
+        })
+        .collect();
+    format!(
+        "{REFUSAL_MARKER} of {} -->\nNot promoted at `{}`: {reasons}.\n\n{LLMS_TRAILER}",
+        approval.map_or("no verdict", |a| &a.url),
+        &head_sha[..SHORT_SHA.min(head_sha.len())],
+    )
 }
 
 fn text(value: &Value) -> &str {
@@ -536,6 +602,8 @@ struct Activity {
     reviews: Vec<Value>,
     comments: Vec<Value>,
     review_comments: Vec<Value>,
+    /// The bot's latest refusal comment, in the order GitHub lists them (oldest first).
+    refusal: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -556,13 +624,32 @@ impl Activity {
                 .filter(|v| v["user"]["login"] == REVIEWER)
                 .collect()
         };
+        let comments = api.pages(&format!("repos/{fork}/issues/{number}/comments"))?;
+        // Only the bot's own: anyone may copy the marker into a comment.
+        let refusal = comments
+            .iter()
+            .rfind(|c| {
+                c["user"]["login"] == BOT_LOGIN && text(&c["body"]).starts_with(REFUSAL_MARKER)
+            })
+            .cloned();
         Ok(Self {
+            refusal,
             reviews: by_reviewer(api.pages(&format!("repos/{fork}/pulls/{number}/reviews"))?),
-            comments: by_reviewer(api.pages(&format!("repos/{fork}/issues/{number}/comments"))?),
+            comments: by_reviewer(comments),
             review_comments: by_reviewer(
                 api.pages(&format!("repos/{fork}/pulls/{number}/comments"))?,
             ),
         })
+    }
+
+    /// The URL of the bot's latest refusal comment if it is `notice`, so that a refusal
+    /// is repeated only once something changed: the head, cgwalters' verdict, the reasons,
+    /// or a different refusal in between.
+    fn said(&self, notice: &str) -> Option<&str> {
+        let last = self.refusal.as_ref()?;
+        // GitHub returns a comment typed into its form with CRLF line ends.
+        (text(&last["body"]).replace("\r\n", "\n").trim() == notice)
+            .then(|| text(&last["html_url"]))
     }
 
     fn is_promote(comment: &Value) -> bool {
@@ -1165,10 +1252,11 @@ mod tests {
         set(
             &mut w,
             "repos/cgwalters-forge/proj/pulls/1",
-            json!({"user":{"login":BOT_LOGIN},"state":"open","title":"Fix the thing",
+            json!({"user":{"login":BOT_LOGIN},"state":"open","title":"Fix the thing","node_id":NODE,
                 "head":{"ref":"bot/fix","sha":HEAD,"repo":{"full_name":"cgwalters-forge/proj"}},
                 "base":{"ref":"main"},"body":body("")}),
         );
+        set(&mut w, "user", json!({"login":BOT_LOGIN}));
         set(
             &mut w,
             "repos/cgwalters-forge/proj",
@@ -1342,7 +1430,23 @@ mod tests {
             "base":{"ref":"main"}})
     }
 
+    const NODE: &str = "PR_node1";
+    const POSTED: &str = "https://github.com/cgwalters-forge/proj/pull/1#issuecomment-20";
+
+    /// A dry run must not comment.
+    fn no_comment(_: &str, _: &str, _: &str) -> Result<String> {
+        panic!("a dry run commented")
+    }
+
     fn promote(w: BTreeMap<String, Option<String>>) -> Result<String> {
+        promote_with(w, true, &no_comment)
+    }
+
+    fn promote_with(
+        w: BTreeMap<String, Option<String>>,
+        dry_run: bool,
+        comment: Comment,
+    ) -> Result<String> {
         let fake = Fake {
             responses: w,
             requests: RefCell::new(0),
@@ -1352,12 +1456,29 @@ mod tests {
         run(
             &Promote {
                 url: URL.into(),
-                dry_run: true,
+                dry_run,
             },
             &Api::new(&fake),
+            comment,
             &mut out,
         )?;
         Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// A promote without `--dry-run`: what it printed, and the comments it posted.
+    fn promote_for_real(w: BTreeMap<String, Option<String>>) -> (Result<String>, Vec<String>) {
+        let posted = RefCell::new(Vec::new());
+        let out = promote_with(w, false, &|repository, subject, body| {
+            assert_eq!((repository, subject), (FORK, NODE));
+            posted.borrow_mut().push(body.to_owned());
+            Ok(POSTED.into())
+        });
+        (out, posted.into_inner())
+    }
+
+    fn bot_comment(id: u64, login: &str, body: &str) -> Value {
+        json!({"user":{"login":login},"body":body,"created_at":"2026-10-10T12:00:00Z","updated_at":"2026-10-10T12:00:00Z",
+            "html_url":format!("https://github.com/cgwalters-forge/proj/pull/1#issuecomment-{id}")})
     }
 
     type Setup = fn(&mut BTreeMap<String, Option<String>>);
@@ -1911,6 +2032,190 @@ mod tests {
         }
     }
 
+    /// Without `--dry-run` a refusal is commented on the fork PR, unless the bot's latest
+    /// refusal comment there is that very comment. Each case gives the comments already
+    /// on the PR as a function of the comment a first refusal posts, cgwalters' reviews,
+    /// whether it is a dry run, whether it comments, and what it prints.
+    #[test]
+    fn refusal_comments() {
+        let unapproved = || {
+            let mut w = world();
+            reviews(&mut w, json!([]));
+            w
+        };
+        let (out, posted) = promote_for_real(unapproved());
+        let out = out.unwrap();
+        assert!(
+            out.contains(&format!(
+                "Commented {POSTED}:\nNot promoted: it is not approved by cgwalters"
+            )),
+            "{out}"
+        );
+        assert_eq!(
+            posted,
+            [format!(
+                "{REFUSAL_MARKER} of no verdict -->\nNot promoted at `111111111111`: it is not approved by cgwalters; only an approving review by cgwalters or a comment of theirs with a '/promote' line promotes a fork PR.\n\n{LLMS_TRAILER}"
+            )]
+        );
+        let notice = posted[0].as_str();
+        let changes = json!([{"user":{"login":REVIEWER},"state":"CHANGES_REQUESTED","submitted_at":"2026-10-10T10:00:00Z",
+            "commit_id":HEAD,"html_url":"https://github.com/cgwalters-forge/proj/pull/1#review-1","body":""}]);
+        let said = "Already said in https://github.com/cgwalters-forge/proj/pull/1#issuecomment-7";
+        type Existing = fn(&str) -> Value;
+        let cases: Vec<(&str, Existing, Value, bool, bool, &str)> = vec![
+            (
+                "said before, with CRLF line ends",
+                |n| {
+                    json!([bot_comment(
+                        7,
+                        BOT_LOGIN,
+                        &format!("{}\r\n", n.replace('\n', "\r\n"))
+                    )])
+                },
+                json!([]),
+                false,
+                false,
+                said,
+            ),
+            (
+                "said before, dry run",
+                |n| json!([bot_comment(7, BOT_LOGIN, n)]),
+                json!([]),
+                true,
+                false,
+                "#issuecomment-7; would stop:\nNot promoted: ",
+            ),
+            (
+                "said before, with other comments since",
+                |n| {
+                    json!([
+                        bot_comment(7, BOT_LOGIN, n),
+                        bot_comment(8, BOT_LOGIN, "Pushed a fix."),
+                        bot_comment(9, REVIEWER, "ok")
+                    ])
+                },
+                json!([]),
+                false,
+                false,
+                said,
+            ),
+            (
+                "the marker in someone else's comment",
+                |n| json!([bot_comment(7, "mallory", n), bot_comment(8, REVIEWER, n)]),
+                json!([]),
+                false,
+                true,
+                "Commented ",
+            ),
+            (
+                "said of an earlier head",
+                |n| {
+                    json!([bot_comment(
+                        7,
+                        BOT_LOGIN,
+                        &n.replace("111111111111", "222222222222")
+                    )])
+                },
+                json!([]),
+                false,
+                true,
+                "Commented ",
+            ),
+            (
+                "another refusal since",
+                |n| {
+                    json!([
+                        bot_comment(7, BOT_LOGIN, n),
+                        bot_comment(
+                            8,
+                            BOT_LOGIN,
+                            &n.replace("is not approved", "has no policy record")
+                        )
+                    ])
+                },
+                json!([]),
+                false,
+                true,
+                "Commented ",
+            ),
+            (
+                "said of an earlier verdict",
+                |n| json!([bot_comment(7, BOT_LOGIN, n)]),
+                changes.clone(),
+                false,
+                true,
+                "Commented ",
+            ),
+        ];
+        for (name, existing, reviewed, dry_run, posts, text) in cases {
+            let mut w = world();
+            reviews(&mut w, reviewed);
+            comments(&mut w, existing(notice));
+            let (out, posted) = if dry_run {
+                (promote(w), Vec::new())
+            } else {
+                promote_for_real(w)
+            };
+            let out = out.unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            assert_eq!(posted.len(), usize::from(posts), "{name}: {out}");
+            assert!(out.contains(text), "{name}: no {text:?} in:\n{out}");
+        }
+
+        // Nothing but the refusal comment is written yet.
+        let (out, posted) = promote_for_real(world());
+        let error = format!("{:#}", out.unwrap_err());
+        assert!(error.contains("unsupported_capability"), "{error}");
+        assert!(posted.is_empty());
+
+        // What an upstream can put in a reason stays text.
+        let hostile = refusal_comment(
+            HEAD,
+            None,
+            &["acme/proj:AI-@mallory [x](http://e/#1) `<b>`\r\n.md is not in the record".into()],
+        );
+        assert!(
+            hostile.contains(
+                ": acme/proj:AI-?mallory ?x?(http://e/?1) ??b????.md is not in the record.\n"
+            ),
+            "{hostile}"
+        );
+
+        let failing: Comment = &|_, _, _| bail!("FORBIDDEN");
+        for (name, setup, expected) in [
+            (
+                "comment refused",
+                (|_| {}) as Setup,
+                "comment the refusal on",
+            ),
+            (
+                "no node id",
+                |w| pr(w, |v| v["node_id"] = Value::Null),
+                "has no node id",
+            ),
+            (
+                "someone else's token",
+                |w| set(w, "user", json!({"login":REVIEWER})),
+                "the token is cgwalters's, but only cgwalters-bot comments refusals",
+            ),
+            (
+                "head moved during the checks",
+                |w| {
+                    let path = "repos/cgwalters-forge/proj/pulls/1";
+                    let mut moved: Value =
+                        serde_json::from_str(w[path].as_deref().unwrap()).unwrap();
+                    moved["head"]["sha"] = OLD.into();
+                    set(w, &format!("then:{path}"), moved);
+                },
+                "changed while it was checked",
+            ),
+        ] {
+            let mut w = unapproved();
+            setup(&mut w);
+            let error = format!("{:#}", promote_with(w, false, failing).expect_err(name));
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
     /// What `bot-pr promote` refuses outright, even in a dry run.
     #[test]
     fn dry_run_errors() {
@@ -2131,7 +2436,7 @@ mod tests {
             url: URL.into(),
             dry_run: true,
         };
-        let error = run(&args, &api, &mut Vec::new()).unwrap_err();
+        let error = run(&args, &api, &no_comment, &mut Vec::new()).unwrap_err();
         assert!(format!("{error:#}").contains("budget"));
         assert_eq!(*fake.requests.borrow(), 3);
     }
@@ -2160,12 +2465,11 @@ mod tests {
             };
             assert_eq!(check_args(&args).is_ok(), ok, "{url}");
         }
-        let error = check_args(&Promote {
+        check_args(&Promote {
             url: URL.into(),
             dry_run: false,
         })
-        .unwrap_err();
-        assert!(error.to_string().contains("--dry-run"));
+        .unwrap();
     }
 
     #[test]

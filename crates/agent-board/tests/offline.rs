@@ -46,13 +46,13 @@ fn status_update_cli_refusals() {
     }
 }
 
-/// promote refuses before reading a token or GitHub; with a valid dry run and no token
+/// promote refuses before reading a token or GitHub; with valid arguments and no token
 /// it stops at authentication (exit 4), having made no request.
 #[test]
 fn promote_cli_refusals() {
     let url = "https://github.com/cgwalters-forge/proj/pull/1";
     for (args, code, reason) in [
-        (vec!["promote", url], 1, "only runs with --dry-run"),
+        (vec!["promote", url], 4, "authentication required"),
         (
             vec![
                 "promote",
