@@ -6,6 +6,7 @@ mod epic;
 mod item;
 mod live;
 mod poll;
+mod promote;
 
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{Capability, Policy, Snapshot};
@@ -82,6 +83,8 @@ enum Command {
         #[command(subcommand)]
         command: Ask,
     },
+    /// Check whether an approved fork PR may go upstream (--dry-run only).
+    Promote(promote::Promote),
     /// Prepare run field updates (proposals only).
     Run {
         #[command(subcommand)]
@@ -730,6 +733,25 @@ fn execute(cli: Cli) -> Result<()> {
                 }
                 Ok(Some(load(&cli)?))
             })
+        }
+        Command::Promote(args) => {
+            ensure!(
+                cli.snapshot.is_none() && cli.json.is_none(),
+                "promote reads GitHub and prints text; --snapshot and --json are unsupported"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported GitHub host"
+            );
+            let config = promote::Config::load(&args.config)?;
+            promote::check_args(args, &config)?;
+            let client = board_forge::github::Client::from_env()?;
+            promote::run(
+                args,
+                &config,
+                &promote::Api::new(&client),
+                &mut io::stdout().lock(),
+            )
         }
         Command::Test {
             command: Test::Project(options),
