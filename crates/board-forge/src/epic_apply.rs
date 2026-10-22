@@ -1160,3 +1160,98 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::epic::EPIC_PLAN_SCHEMA;
+    use std::cell::{Cell, RefCell};
+
+    fn config() -> Config {
+        Config::from_json(
+            &json!({"operator": "operator", "bot": "planner", "repositories": ["example/work"],
+            "project": "P_config", "priority_field": "Order", "priority_field_id": "F_config",
+            "priorities": {"High": "O_high", "Normal": "O_normal"}, "default_priority": "Normal"}),
+        )
+        .unwrap()
+    }
+
+    fn issue() -> ItemRef {
+        crate::github::parse_github_issue("example/epics#1", None, "github.com").unwrap()
+    }
+
+    /// The epic is CLOSED (and says so if asked); the plan creates a sub-issue.
+    struct ClosedEpic {
+        comments: RefCell<Vec<Value>>,
+        created: Cell<usize>,
+        asked_state: Cell<bool>,
+    }
+
+    impl Transport for ClosedEpic {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            if query.contains("viewer") {
+                return Ok(json!({"viewer": {"login": "planner"}}));
+            }
+            if query.contains("comments(first") {
+                return Ok(json!({"repository": {"issue": {"comments": {"nodes": *self.comments.borrow(),
+                    "pageInfo": {"hasNextPage": false}}}}}));
+            }
+            if query.contains("subIssues(first") {
+                self.asked_state.set(query.contains("state") && query.contains("closed") || query.lines().any(|l| l.trim() == "state"));
+                return Ok(json!({"repository": {"issue": {"id": "E", "state": "CLOSED", "closed": true,
+                    "labels": {"nodes": [{"name": "epic"}]},
+                    "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": false}}}}}));
+            }
+            if query.starts_with("query") {
+                return Ok(json!({"repository": {"issue": {"id": format!("I{}", variables["number"])}}}));
+            }
+            if query.contains("addSubIssue(") {
+                return Ok(json!({"addSubIssue": {"issue": {"id": "E"}}}));
+            }
+            if query.contains("addProjectV2ItemById(") {
+                return Ok(json!({"addProjectV2ItemById": {"item": {"id": "M"}}}));
+            }
+            Ok(json!({"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "M"}}}))
+        }
+    }
+
+    impl Rest for ClosedEpic {
+        fn get(&self, _: &str, _: Option<(&str, &str)>) -> Result<crate::poll::RestResponse> {
+            anyhow::bail!("unexpected GET")
+        }
+        fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+            let path = url.strip_prefix(API_ROOT).unwrap();
+            if method == "POST" && path == "repos/example/work/issues" {
+                self.created.set(self.created.get() + 1);
+                return Ok((201, json!({"number": 10})));
+            }
+            if method == "POST" && path == "repos/example/epics/issues/1/comments" {
+                let id = self.comments.borrow().len() as u64 + 1;
+                self.comments.borrow_mut().push(json!({"url": format!("https://github.com/example/epics/issues/1#issuecomment-{id}"),
+                    "body": body["body"], "createdAt": "2026-10-14T10:00:00Z", "lastEditedAt": null,
+                    "author": {"login": "planner"}, "editor": null}));
+                return Ok((201, json!({"id": id})));
+            }
+            Ok((200, json!({})))
+        }
+    }
+
+    #[test]
+    fn audit_apply_on_a_closed_epic() {
+        let plan = json!({"schema": EPIC_PLAN_SCHEMA, "epic": "example/epics#1", "actions": [
+            {"type": "create_sub_issue", "repo": "example/work", "title": "child", "body": "scope"}]});
+        let forge = ClosedEpic {
+            comments: RefCell::new(vec![json!({"url": "https://github.com/example/epics/issues/1#issuecomment-1",
+                "body": format!("```{EPIC_PLAN_FENCE}\n{plan}\n```"), "createdAt": "2026-10-14T10:00:00Z",
+                "lastEditedAt": null, "author": {"login": "planner"}, "editor": null})]),
+            created: Cell::new(0),
+            asked_state: Cell::new(false),
+        };
+        let preview = preview(&forge, &issue(), &config());
+        let result = apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH);
+        assert!(!forge.asked_state.get(), "the epic query asks for the epic's state");
+        assert!(preview.is_err(), "preview of a plan on a closed epic: {preview:?}");
+        assert!(result.is_err(), "applied a plan on a closed epic: {result:?}");
+        assert_eq!(forge.created.get(), 0, "created a sub-issue under a closed epic");
+    }
+}

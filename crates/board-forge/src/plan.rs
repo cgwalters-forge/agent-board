@@ -2331,3 +2331,58 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod audit {
+    use super::*;
+
+    fn plan_text() -> String {
+        format!("{:#}", json!({"schema": JOB_PLAN_SCHEMA, "repo": "ostreedev/ostree", "item": 3665,
+            "kind": "implement", "runner": "hosted", "brief": "Do it."}))
+    }
+
+    #[test]
+    fn audit_plan_quoted_in_an_outer_fence_is_not_a_plan() {
+        let inner = format!("```{PLAN_FENCE}\n{}\n```", plan_text());
+        for body in [
+            // The format docs show a plan this way; pasted as a comment it renders as a code sample.
+            format!("The plan format is:\n\n````markdown\n{inner}\n````\n"),
+            format!("~~~\n{inner}\n~~~\n"),
+            format!("<!--\n{inner}\n-->\nNothing to see.\n"),
+        ] {
+            let found = JobPlan::from_comment(&body);
+            assert!(matches!(found, Ok(None)), "{body}\n{found:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit2 {
+    use super::*;
+
+    fn c(n: u32, author: &str, editor: Option<&str>, at: &str, body: &str) -> Comment {
+        Comment {
+            url: format!("https://github.com/x/y/issues/1#issuecomment-{n}"),
+            body: body.into(),
+            author: Some(author.into()),
+            edited: editor.is_some(),
+            editor: editor.map(Into::into),
+            changed: OffsetDateTime::parse(at, &Rfc3339).unwrap(),
+        }
+    }
+
+    #[test]
+    fn audit_writer_removing_own_newest_plan_revives_the_older_one() {
+        let plan = |brief: &str| {
+            format!("```{PLAN_FENCE}\n{}\n```", json!({"schema": JOB_PLAN_SCHEMA, "repo": "x/y", "item": 1,
+                "kind": "implement", "runner": "hosted", "brief": brief}))
+        };
+        let comments = [
+            c(1, "op", None, "2026-10-13T10:00:00Z", &plan("old")),
+            // The planner's newer plan, which the operator then edits to withdraw (fence removed).
+            c(2, "bot", Some("op"), "2026-10-13T12:00:00Z", "Withdrawn."),
+        ];
+        let got = newest_plan(&comments, &["op", "bot"]).map(|(p, _)| p.brief);
+        assert!(got.is_err(), "withdrawing the newest plan revived: {got:?}");
+    }
+}

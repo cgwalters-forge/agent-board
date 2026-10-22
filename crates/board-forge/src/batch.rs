@@ -537,3 +537,52 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod audit {
+    use super::*;
+    use crate::plan::PLAN_FENCE;
+
+    /// An epic of #10 and #11, both small; #11 has one implement plan with a brief of `len`.
+    struct Forge(usize);
+
+    impl Transport for Forge {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            let node = |n: u64| json!({"number": n, "state": "OPEN", "body": "",
+                "repository": {"nameWithOwner": "example/work"},
+                "labels": {"nodes": [{"name": "small"}], "totalCount": 1},
+                "issueDependenciesSummary": {"blockedBy": 0},
+                "closedByPullRequestsReferences": {"totalCount": 0}});
+            if query == FAMILY_QUERY {
+                let mut primary = node(10);
+                primary["parent"] = json!({"subIssues": {"nodes": [node(10), node(11)], "pageInfo": {"hasNextPage": false}}});
+                return Ok(json!({"repository": {"issue": primary}}));
+            }
+            assert!(query.contains("comments(first"), "{query}");
+            assert_eq!(variables["number"], 11);
+            let plan = json!({"schema": crate::plan::JOB_PLAN_SCHEMA, "repo": "example/work", "item": 11,
+                "kind": "implement", "runner": "hosted", "brief": "y".repeat(self.0)});
+            Ok(json!({"repository": {"issue": {"comments": {"nodes": [{
+                "url": "https://github.com/example/work/issues/11#issuecomment-5",
+                "body": format!("```{PLAN_FENCE}\n{plan}\n```"), "createdAt": "2026-10-13T10:00:00Z",
+                "lastEditedAt": null, "author": {"login": "planner"}, "editor": null}],
+                "pageInfo": {"hasNextPage": false}}}}}))
+        }
+    }
+
+    #[test]
+    fn audit_batched_brief_stays_within_limit() {
+        let issue = ItemRef { host: "github.com".into(), repository: "example/work".into(), number: 10 };
+        let primary = JobPlan {
+            repo: "example/work".into(), item: 10, kind: "implement".into(), runner: "hosted".into(),
+            pool: String::new(), brief: "x".repeat(crate::plan::PLAN_BRIEF_LIMIT), stacks_on: None,
+        };
+        // The extra's section header is "\n\n## example/work#11\n\n" (22 chars); its brief fills
+        // the limit exactly, by select's own accounting.
+        let extra_len = BATCH_BRIEF_LIMIT - crate::plan::PLAN_BRIEF_LIMIT - 22;
+        let batch = select(&Forge(extra_len), &issue, &primary, &["planner"], 1).unwrap();
+        assert_eq!(batch.extras.len(), 1, "{:?}", batch.notes);
+        let task = brief(&primary, &batch.extras.iter().collect::<Vec<_>>());
+        assert!(task.chars().count() <= BATCH_BRIEF_LIMIT, "task is {} characters", task.chars().count());
+    }
+}

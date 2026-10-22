@@ -439,4 +439,27 @@ mod tests {
         );
         assert_eq!(offline.reads.borrow().len(), STATUS_REQUEST_LIMIT);
     }
+
+    // ---- audit probes (throwaway) ----
+
+    #[test]
+    fn audit_review_request_login_case() {
+        let (mut snapshot, config, mut offline) = fixture();
+        snapshot.items[0].content_kind = "pull_request".into();
+        offline.pull["requested_reviewers"] = json!([{"login": "Operator"}]);
+        let plan = plan(&offline, &snapshot, &config, "operator").unwrap();
+        assert_eq!(plan.actions.len(), 1, "a review request by the operator under GitHub's casing");
+    }
+
+    #[test]
+    fn audit_one_closed_pull_fails_the_whole_plan() {
+        let (mut snapshot, config, offline) = fixture();
+        let mut other = snapshot.items[0].clone();
+        other.identity.number = 99;
+        other.content_kind = "pull_request".into();
+        snapshot.items.push(other);
+        // The fake answers every pull read with number 1, so #99 reads as changed.
+        let result = plan(&offline, &snapshot, &config, "operator");
+        assert!(result.is_ok(), "{result:?}");
+    }
 }

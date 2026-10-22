@@ -2210,4 +2210,194 @@ mod tests {
             assert!(State::from_json(&bad).is_err(), "{field}");
         }
     }
+
+    // ---- audit probes (throwaway) ----
+
+    #[test]
+    fn audit_answer_round_out_of_budget_consumes_the_answer_without_a_run_or_a_stop() {
+        let fake = github();
+        let thread = format!("{API_ROOT}repos/upstream/app/issues/7/comments?per_page=100");
+        let stop = Marker {
+            id: Some(50),
+            rounds: 2,
+            sha: Some("abcdef0123456789".into()),
+            stopped: true,
+            ..Marker::default()
+        };
+        fake.rest
+            .borrow_mut()
+            .get_mut(&thread)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": 50, "user": {"login": BOT}, "created_at": "2026-10-16T08:00:00Z",
+                "body": marker_body(&stop.state(), "stopped")}));
+        let config = config();
+        let apply = Apply {
+            dispatcher: &fake,
+            workflow: "dispatch.yml".into(),
+            pools: vec![],
+        };
+        // Enough for the claim (a write and a read) and the marker; not the dispatch.
+        let mut pass = Pass {
+            rest: &fake,
+            graphql: &fake,
+            config: &config,
+            now: now(),
+            previous: BTreeMap::new(),
+            used: BTreeMap::new(),
+            remaining: 3,
+            apply: Some(apply),
+            dispatched: 0,
+            queues: BTreeMap::new(),
+            outages: None,
+            paces: None,
+            envelope: None,
+        };
+        let read = fake.rest.borrow()[&thread].as_array().unwrap().clone();
+        let said = [Said {
+            key: "issuecomment-100".into(),
+            at: now(),
+            body: "Please rename.".into(),
+        }];
+        let pull = json!({"number": 7, "headRefOid": "abcdef0123456789"});
+        let result = pass.answer_round("upstream/app", &pull, (&stop, &read), (&said, &json!(77)));
+        assert!(result.is_err(), "{result:?}");
+        assert!(dispatches(&fake).is_empty());
+        let comments = fake.rest.borrow()[&thread].as_array().unwrap().clone();
+        let newest = find_marker(&comments, BOT);
+        eprintln!("newest marker after budget failure: {newest:?}");
+        // What the next pass sees: the answer named as acted on, no run, no stop.
+        assert!(handled(&comments, BOT, now()).0.contains("issuecomment-100"));
+        assert_eq!(newest.run, None);
+        assert!(
+            newest.stopped,
+            "expected a stop (or the answer left pending); got a round marker naming the answer as done"
+        );
+    }
+
+    #[test]
+    fn audit_tracking_issue_is_duplicated_when_the_claim_rewrite_fails() {
+        let fake = someones_pull();
+        *fake.broken.borrow_mut() = true;
+        let first = pass(&fake, None, true);
+        assert_eq!(first.errors, 1, "{:?}", first.lines);
+        *fake.broken.borrow_mut() = false;
+        let again = resume(&fake, &first);
+        let later = resume_later(&fake, &again);
+        assert_eq!(later.errors, 0, "{:?}", later.lines);
+        assert_eq!(dispatches(&fake).len(), 2);
+        let created: Vec<Value> = fake
+            .writes
+            .borrow()
+            .iter()
+            .filter(|(w, _)| w == &format!("POST {API_ROOT}repos/{DISPATCH}/issues"))
+            .map(|(_, b)| b["title"].clone())
+            .collect();
+        assert_eq!(created.len(), 1, "tracking issues opened: {created:?}");
+    }
+
+    #[test]
+    fn audit_refusal_retry_quotes_the_same_comment_again_on_the_tracking_issue() {
+        let fake = someones_pull();
+        *fake.refused.borrow_mut() = Some(404);
+        let first = pass(&fake, None, true);
+        let _again = resume(&fake, &first);
+        let more: Vec<String> = fake
+            .writes
+            .borrow()
+            .iter()
+            .filter(|(w, b)| {
+                w.starts_with(&format!("POST {API_ROOT}repos/{DISPATCH}/issues/"))
+                    && w.ends_with("/comments")
+                    && text(b, "/body").starts_with("More from")
+            })
+            .map(|(w, _)| w.clone())
+            .collect();
+        assert!(more.is_empty(), "the retry re-quoted the comment: {more:?}");
+    }
+
+    #[test]
+    fn audit_saved_page_is_kept_when_the_cursor_is_clamped_to_the_lookback() {
+        let fake = github();
+        let mut items = vec![hit(ISSUE, "someone", false, "2026-10-16T10:00:00Z")];
+        for n in 0..70u64 {
+            let at = format!("2026-10-16T11:{:02}:{:02}Z", n / 60, n % 60);
+            items.push(hit(&format!("upstream/quiet#{n}"), "someone", false, &at));
+            fake.page(
+                &format!("repos/upstream/quiet/issues/{n}/comments?per_page=100"),
+                json!([]),
+            );
+        }
+        fake.rest
+            .borrow_mut()
+            .get_mut(&format!("{API_ROOT}search"))
+            .unwrap()["items"] = items.into();
+        // A state from a pass more than the lookback ago, which left its
+        // search at page 3: the cursor is clamped to the lookback, the page kept.
+        let first = pass_from(&fake, (Some("2026-10-10T00:00:00Z"), Some(3)), true);
+        eprintln!(
+            "first: cursor {:?} page {:?} searched {:?}",
+            first.state.operator_cursor,
+            first.state.operator_page,
+            fake.searched.borrow()
+        );
+        let missed = dispatches(&fake).is_empty();
+        let second = resume(&fake, &first);
+        eprintln!("second: {:?}", second.lines);
+        assert!(
+            !missed,
+            "the operator's comment on page 1 was skipped by the stale page; found next pass: {}",
+            !dispatches(&fake).is_empty()
+        );
+    }
+
+    #[test]
+    fn audit_scope_matching_is_case_sensitive_while_the_search_is_not() {
+        assert!(in_scope(&["Upstream/*".into()], "upstream/app"));
+    }
+
+    #[test]
+    fn audit_scope_case_end_to_end() {
+        let fake = github();
+        let config = Config {
+            operator: OPERATOR.into(),
+            bot: BOT.into(),
+            dispatch_repo: DISPATCH.into(),
+            review_workflow: None,
+            policy: PollPolicy::from_json(
+                &json!({"operatorComments": {"repositories": ["Upstream/*"]}, "kindPools": {"triage": "small"}}),
+            )
+            .unwrap(),
+        };
+        let outcome = run(
+            &fake,
+            &fake,
+            &config,
+            State::default(),
+            &[],
+            &[],
+            Some(Apply {
+                dispatcher: &fake,
+                workflow: "dispatch.yml".into(),
+                pools: vec![],
+            }),
+            now(),
+        )
+        .unwrap();
+        eprintln!("{:?}", outcome.lines);
+        assert!(!dispatches(&fake).is_empty(), "{:?}", outcome.lines);
+    }
+
+    #[test]
+    fn audit_explicit_mentions() {
+        for (body, wanted) in [
+            ("mail me at foo@worker.org", false),
+            ("@Worker please look", true),
+            ("/bot_x", false),
+        ] {
+            assert_eq!(explicit(body, BOT), wanted, "{body}");
+        }
+    }
 }

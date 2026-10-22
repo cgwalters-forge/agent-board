@@ -727,3 +727,62 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod audit {
+    use super::*;
+    use crate::poll::RestResponse;
+
+    struct Forge {
+        runs: Vec<&'static str>,
+        texts: std::collections::BTreeMap<&'static str, &'static str>,
+    }
+
+    impl Transport for Forge {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            if query == PULLS_QUERY {
+                return Ok(json!({"repository": {"pullRequests": {"nodes": []}}}));
+            }
+            assert_eq!(query, TEXT_QUERY);
+            let key = format!("{}/{}#{}", variables["owner"], variables["name"], variables["number"]).replace('"', "");
+            let body = self.texts.get(key.as_str()).copied().unwrap_or_default();
+            Ok(json!({"repository": {"issue": {"title": "T", "body": body}}}))
+        }
+    }
+
+    impl Rest for Forge {
+        fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+            let runs: Vec<Value> = if url.contains("status=in_progress") {
+                self.runs.iter().map(|t| json!({"display_title": t})).collect()
+            } else {
+                vec![]
+            };
+            Ok(RestResponse { status: 200, etag: None, last_modified: None, link: None, body: json!({"workflow_runs": runs}) })
+        }
+        fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+            panic!()
+        }
+    }
+
+    #[test]
+    fn audit_abbreviations_are_paths() {
+        // Common abbreviations are read as file names.
+        let found: Vec<String> = paths("Fix the loop, e.g. the retry, i.e. the backoff (a.k.a. jitter) on github.com and Node.js.").into_iter().collect();
+        assert_eq!(found, ["Node.js", "a.k.a", "e.g", "github.com", "i.e"]);
+    }
+
+    #[test]
+    fn audit_shared_abbreviation_waits_on_run_in_flight() {
+        let target = Target { caller: "cgwalters-forge/tracker".into(), workflow: "dispatch.yml".into(), git_ref: "main".into() };
+        let issue = ItemRef { host: "github.com".into(), repository: "example/work".into(), number: 10 };
+        let forge = Forge {
+            runs: vec!["implement example/work#11"],
+            texts: [
+                ("example/work#10", "Make the retry bounded, e.g. five attempts, in src/retry.rs."),
+                ("example/work#11", "Document the pools, e.g. claude, in docs/pools.md."),
+            ].into(),
+        };
+        let decision = decide(&forge, &issue, &issue, "Do it.", "agentic-bot", &target);
+        assert_eq!(decision, Decision::Independent("no open pull request of agentic-bot changes a path it names".into()), "{decision:?}");
+    }
+}

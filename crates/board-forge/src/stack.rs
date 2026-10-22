@@ -317,3 +317,24 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod audit {
+    use super::*;
+
+    #[test]
+    fn audit_github_closing_forms() {
+        // Forms GitHub links to the issue (docs: "Linking a pull request to an issue").
+        for body in [
+            "- Closes #41",
+            "* Fixes #41",
+            "Closes #41, closes #42",
+            "Closes #42, closes #41",
+            "Fixes #41 and fixes #40",
+            "Closes #41 (part of the epic)",
+            "This closes #41",
+        ] {
+            assert!(closes(body, "example/widgets", 41), "{body:?}");
+        }
+    }
+}

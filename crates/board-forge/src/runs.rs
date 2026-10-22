@@ -128,3 +128,39 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod audit {
+    use super::*;
+    use crate::poll::RestResponse;
+    use serde_json::{Value, json};
+
+    struct Fake(Value);
+    impl Rest for Fake {
+        fn get(&self, _: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+            Ok(RestResponse { status: 200, etag: None, last_modified: None, link: None, body: self.0.clone() })
+        }
+        fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+            panic!()
+        }
+    }
+
+    #[test]
+    fn audit_pooled_run_name_is_found() {
+        let item = parse_github_item("example/code#3", None, "github.com").unwrap();
+        // The caller names a run `KIND OWNER/REPO#N (POOL)` (overlap.rs, supervise::run_title).
+        let fake = Fake(json!({"total_count": 1, "workflow_runs": [{"display_title": "implement example/code#3 (claude)",
+            "html_url": "https://github.com/example/runners/actions/runs/42"}]}));
+        let found = find(&fake, "example/runners", &item, "implement");
+        assert!(found.is_ok(), "{found:?}");
+    }
+
+    #[test]
+    fn audit_caller_case_is_ignored_like_github_does() {
+        let item = parse_github_item("example/code#3", None, "github.com").unwrap();
+        let fake = Fake(json!({"total_count": 1, "workflow_runs": [{"display_title": "implement example/code#3",
+            "html_url": "https://github.com/example/runners/actions/runs/42"}]}));
+        let found = find(&fake, "Example/Runners", &item, "implement");
+        assert!(found.is_ok(), "{found:?}");
+    }
+}

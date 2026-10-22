@@ -1520,3 +1520,81 @@ mod tests {
         assert_eq!(forge.reads.get(), 0);
     }
 }
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::plan::JOB_PLAN_SCHEMA;
+
+    const EPIC: &str = "cgwalters-forge/tracker#572";
+
+    fn epic() -> Epic {
+        Epic {
+            issue: IssueRef::parse(EPIC).unwrap(),
+            id: "I_epic".into(),
+            designated: true,
+            sub_issues: vec![
+                IssueRef::parse("cgwalters-forge/agent-board#63").unwrap(),
+                IssueRef::parse("cgwalters-forge/tracker#573").unwrap(),
+            ],
+            closed: vec![IssueRef::parse("cgwalters-forge/tracker#574").unwrap()],
+        }
+    }
+
+    fn bounds() -> Bounds {
+        Bounds {
+            repositories: vec![
+                "cgwalters-forge/tracker".into(),
+                "cgwalters-forge/agent-board".into(),
+            ],
+            priorities: vec!["P0".into(), "P1".into()],
+        }
+    }
+
+    fn plan(actions: Vec<Value>) -> Value {
+        json!({"schema": EPIC_PLAN_SCHEMA, "epic": EPIC, "actions": actions})
+    }
+
+    /// A slice may stack on a sub-issue the same plan closes as not planned.
+    #[test]
+    fn audit_stacks_on_a_sub_issue_the_plan_closes() {
+        let actions = vec![
+            json!({"type": "close_sub_issue", "issue": "cgwalters-forge/agent-board#63", "reason": "Dropped."}),
+            json!({"type": "create_sub_issue", "repo": "cgwalters-forge/agent-board",
+                "title": "upper", "body": "Builds on #63.", "stacks_on": "cgwalters-forge/agent-board#63",
+                "plan": {"schema": JOB_PLAN_SCHEMA, "kind": "implement", "runner": "hosted", "brief": "b"}}),
+        ];
+        let result = EpicPlan::validate(&plan(actions), &bounds(), &epic());
+        assert!(result.is_err(), "accepted a slice stacked on a sub-issue the plan closes: {result:?}");
+    }
+
+    /// Same, the other way round: close after the stack.
+    #[test]
+    fn audit_closes_a_sub_issue_a_new_slice_stacks_on() {
+        let actions = vec![
+            json!({"type": "create_sub_issue", "repo": "cgwalters-forge/agent-board",
+                "title": "upper", "body": "Builds on #63.", "stacks_on": "cgwalters-forge/agent-board#63",
+                "plan": {"schema": JOB_PLAN_SCHEMA, "kind": "implement", "runner": "hosted", "brief": "b"}}),
+            json!({"type": "close_sub_issue", "issue": "cgwalters-forge/agent-board#63", "reason": "Dropped."}),
+        ];
+        let result = EpicPlan::validate(&plan(actions), &bounds(), &epic());
+        assert!(result.is_err(), "accepted a close of the sub-issue a new slice stacks on: {result:?}");
+    }
+
+    /// The epic label as read_epic sees it, against how the supervisor sees it.
+    #[test]
+    fn audit_epic_label_case() {
+        struct Forge;
+        impl Transport for Forge {
+            fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+                Ok(json!({"repository": {"issue": {"id": "I", "labels": {"nodes": [{"name": "Epic"}]},
+                    "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": false}}}}}))
+            }
+        }
+        let issue = crate::github::parse_github_issue("cgwalters-forge/tracker#572", None, "github.com").unwrap();
+        let epic = read_epic(&Forge, &issue).unwrap();
+        // health::epics, judgment::has_label and tracker's census all compare
+        // the label name without regard to case; read_epic does not.
+        assert!(epic.designated, "an epic labelled \"Epic\" is not designated");
+    }
+}
