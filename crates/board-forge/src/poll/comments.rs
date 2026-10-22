@@ -1247,7 +1247,19 @@ mod tests {
                 // The recorded results, a page of them as the URL asks.
                 let mut found = self.rest.borrow()[&format!("{API_ROOT}search")].clone();
                 let page: usize = url.rsplit_once("&page=").unwrap().1.parse().unwrap();
-                let items = found["items"].as_array().unwrap().clone();
+                // As GitHub does, only the threads updated since the query's time.
+                let since = url
+                    .split_once("updated%3A%3E%3D")
+                    .and_then(|(_, rest)| rest.split('+').next())
+                    .map(|s| s.replace("%3A", ":"))
+                    .unwrap();
+                let items: Vec<Value> = found["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|i| text(i, "/updated_at") >= since.as_str())
+                    .cloned()
+                    .collect();
                 found["total_count"] = items.len().into();
                 found["items"] = items
                     .into_iter()
@@ -1962,6 +1974,51 @@ mod tests {
         );
     }
 
+    /// Resuming at a saved page backs off one page for threads that moved to
+    /// the end meanwhile. More than a page of them moved, a thread not yet
+    /// read shifts past the resumed page, and once the search ends the cursor
+    /// is `now`: older than the lag, the thread is never found again.
+    #[test]
+    fn a_thread_not_yet_read_survives_more_than_a_page_of_threads_moving() {
+        let fake = github();
+        let search = format!("{API_ROOT}search");
+        let mut items = Vec::new();
+        for n in 0..70u64 {
+            let at = format!("2026-10-16T11:00:{:02}Z", n % 60);
+            let at = if n >= 60 { format!("2026-10-16T11:01:{:02}Z", n - 60) } else { at };
+            items.push(hit(&format!("upstream/quiet#{n}"), "someone", false, &at));
+            fake.page(
+                &format!("repos/upstream/quiet/issues/{n}/comments?per_page=100"),
+                json!([]),
+            );
+        }
+        items.push(hit(ISSUE, "someone", false, "2026-10-16T11:01:30Z"));
+        fake.rest.borrow_mut().get_mut(&search).unwrap()["items"] = items.into();
+
+        let first = pass(&fake, None, true);
+        assert!(dispatches(&fake).is_empty(), "{:?}", first.lines);
+        assert_eq!(first.state.operator_page, Some(3));
+        // Between passes, 35 of the threads on the first two pages are
+        // updated: they move to the end, and the rest shift forward.
+        {
+            let mut rest = fake.rest.borrow_mut();
+            let items = rest.get_mut(&search).unwrap()["items"].as_array_mut().unwrap();
+            for item in items.iter_mut().take(35) {
+                item["updated_at"] = json!("2026-10-16T11:59:00Z");
+            }
+            items.sort_by(|a, b| text(a, "/updated_at").cmp(text(b, "/updated_at")));
+        }
+        let second = resume(&fake, &first);
+        let third = resume(&fake, &second);
+        assert_eq!(
+            dispatches(&fake).len(),
+            1,
+            "the operator's comment on {ISSUE} was never acted on: {:?} then {:?}",
+            second.lines,
+            third.lines
+        );
+    }
+
     #[test]
     fn a_refused_run_is_tried_again_and_an_uncertain_one_is_not() {
         // Refused each time, it is given up after its tries; a server error
@@ -1998,6 +2055,40 @@ mod tests {
             ]
         );
         assert_eq!((marker(&fake).rounds, marker(&fake).run), (1, Some(1234)));
+    }
+
+    /// A run GitHub refused is tried again on later passes (design.md:
+    /// "recorded on its claim or marker, without using the round, and tried
+    /// again"). Here the write that records the refusal fails, as a 502 on
+    /// the PATCH would: the claim and the marker, posted before the dispatch,
+    /// name the comments without refusing them, and read as done.
+    #[test]
+    fn a_refusal_that_could_not_be_recorded_is_still_tried_again() {
+        let fake = github();
+        *fake.refused.borrow_mut() = Some(404);
+        *fake.broken.borrow_mut() = true;
+        let first = pass(&fake, None, true);
+        assert_eq!(first.errors, 2, "{:?}", first.lines);
+        assert_eq!(dispatches(&fake).len(), 2);
+        let thread = format!("{API_ROOT}repos/upstream/app/issues/7/comments?per_page=100");
+        let marker =
+            |fake: &Fake| find_marker(fake.rest.borrow()[&thread].as_array().unwrap(), BOT);
+        // No run was started, so the round is not used.
+        assert_eq!((marker(&fake).rounds, marker(&fake).run), (0, None));
+
+        *fake.refused.borrow_mut() = None;
+        *fake.broken.borrow_mut() = false;
+        let again = resume(&fake, &first);
+        assert_eq!(again.errors, 0, "{:?}", again.lines);
+        assert_eq!(again.lines.len(), 3, "{:?}", again.lines);
+        assert_eq!(
+            again.lines[..2],
+            [
+                "upstream/app#7 operator comments issuecomment-100, discussion_r200: fix round 1 -> https://github.com/example/tracker/actions/runs/1234",
+                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/example/tracker/actions/runs/1234",
+            ]
+        );
+        assert_eq!(dispatches(&fake).len(), 4);
     }
 
     #[test]

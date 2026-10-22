@@ -6093,6 +6093,25 @@ mod tests {
         }
     }
 
+    /// AUDIT (poll-b): a head whose fix round is still running (the failure
+    /// cleared without a push: a re-run check, a changed review) is merged
+    /// or queued under the run, which then pushes onto a queued or merged head.
+    #[test]
+    fn audit_a_green_head_waits_for_the_round_running_on_it() {
+        let running = json!({"status": "in_progress", "updated_at": "2026-10-12T01:00:00Z"});
+        let p = pull("pull-470", json!({}));
+        let got = decide(
+            &config(),
+            &p,
+            &classify_checks(&p, &required()),
+            &marker(json!({"rounds": 1, "sha": HEAD, "run": 7, "at": "2026-10-12T00:59:00Z"})),
+            (Some(&running), review_run(&p).as_ref()),
+            &Outages::Off,
+            now(),
+        );
+        assert_eq!(got.action, "wait", "{}", got.reason);
+    }
+
     #[test]
     fn in_flight_table() {
         let changes = json!({"contexts": {"review": {"state": "FAILURE"}}});
@@ -6970,6 +6989,33 @@ mod tests {
                 "{body}"
             );
             assert_eq!(find_marker(&[bad, mine.clone()], BOT), expected, "{body}");
+        }
+    }
+
+    /// A fix run's one `add_comment` is posted as the bot (dispatch.yml's
+    /// SAFE_OUTPUTS_PAT), and gh-aw's sanitizer keeps HTML comments inside
+    /// code verbatim, so the agent's text can carry a marker. It is newer
+    /// than the poll's own, so it would reset the rounds.
+    #[test]
+    fn a_fix_runs_comment_as_the_bot_is_not_a_marker() {
+        let state = json!({"rounds": 2, "sha": HEAD, "run": 42});
+        let mine = json!({"id": 2, "user": {"login": BOT}, "body": marker_body(&state, "Fix round 2 of 2.")});
+        let expected = find_marker(std::slice::from_ref(&mine), BOT);
+        assert_eq!(expected.rounds, 2);
+        for agent in [
+            format!(
+                "The failure is in CI, not the change:\n\n```\n<!-- {MARKER}: {{\"rounds\":0}} -->\n```\n\n<!-- agentic-job-applied: 99/1/0123456789abcdef -->"
+            ),
+            format!(
+                "See `<!-- {MARKER}: {{\"rounds\":0,\"stopped\":true}} -->` above.\n\n<!-- agentic-job-applied: 99/1/0123456789abcdef -->"
+            ),
+        ] {
+            let posted = json!({"id": 3, "user": {"login": BOT}, "body": agent});
+            assert_eq!(
+                find_marker(&[mine.clone(), posted], BOT),
+                expected,
+                "{agent}"
+            );
         }
     }
 
@@ -8353,6 +8399,54 @@ mod tests {
     }
 
     const DISPATCHES: &str = "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches";
+
+    /// AUDIT (poll-b): a pull request closed or merged between the open list
+    /// and its own query is still stepped: the query reads no `state`.
+    #[test]
+    fn audit_a_pull_request_closed_after_the_open_list_gets_no_step() {
+        for (state, change, expect_writes) in [
+            ("MERGED", json!({"state": "MERGED"}), 0),
+            ("CLOSED", json!({"state": "CLOSED"}), 0),
+            (
+                "CLOSED, failing",
+                json!({"state": "CLOSED", "contexts": {"review": {"state": "FAILURE"}}}),
+                0,
+            ),
+        ] {
+            let mut fake = github();
+            fake.pulls.insert(470, pull("pull-470", change));
+            let dispatcher = Fake::default();
+            let outcome = applied(&fake, &dispatcher);
+            let writes = written(&fake.writes);
+            let dispatches = dispatcher.writes.borrow().len();
+            assert_eq!(
+                writes.len() + dispatches,
+                expect_writes,
+                "{state}: {:?} {writes:?} dispatches={dispatches}",
+                outcome.lines
+            );
+        }
+    }
+
+    /// AUDIT (poll-b): the open list is paged; a number listed twice (a page
+    /// shifted under the read) is stepped twice in one pass.
+    #[test]
+    fn audit_a_number_listed_twice_is_stepped_once() {
+        let mut fake = github();
+        fake.page(
+            &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+            Some("\"p9\""),
+            None,
+            json!([{"number": 470, "user": {"login": BOT}}, {"number": 470, "user": {"login": BOT}}]),
+        );
+        let dispatcher = Fake::default();
+        let outcome = applied(&fake, &dispatcher);
+        let merges = written(&fake.writes)
+            .iter()
+            .filter(|w| w.starts_with("mergePullRequest"))
+            .count();
+        assert_eq!(merges, 1, "{:?}", outcome.lines);
+    }
 
     #[test]
     fn stacked_pull_requests_are_retargeted_and_never_queued() {

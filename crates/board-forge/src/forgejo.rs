@@ -723,6 +723,14 @@ mod tests {
                 Some(Turn::None),
                 vec!["blocked/ label without a reason"],
             ),
+            // AUDIT: README and design.md say a label board reads
+            // `priority/P1`..`priority/P3`; `priority/P0` is not documented.
+            (
+                vec!["priority/P0", "turn/operator"],
+                None,
+                Some(Turn::Operator),
+                vec!["unknown label \"priority/P0\""],
+            ),
         ] {
             let mut labels: Vec<_> = labels.into_iter().map(str::to_owned).collect();
             labels.push("agent-board".into());

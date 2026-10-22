@@ -751,6 +751,47 @@ mod tests {
     }
 
     #[test]
+    fn history_fallback_reads_github_edit_history_as_served() {
+        // As github.com serves it (observed 2026-10-20): userContentEdits
+        // nodes come newest first, UserContentEdit has no previousVersion
+        // field, and `diff` is the body as that edit left it.
+        let ticked = ORIGINAL.replace("- [ ] B)", "- [x] B)");
+        for (name, history) in [
+            (
+                "github shape",
+                json!([
+                    {"editor":{"login":"sample-human"},"editedAt":"2026-01-02T00:00:00Z","diff":ticked},
+                    {"editor":{"login":"sample-bot"},"editedAt":"2026-01-01T00:00:00Z","diff":ORIGINAL},
+                ]),
+            ),
+            (
+                "queried field, newest first",
+                json!([
+                    {"editor":{"login":"sample-human"},"previousVersion":ORIGINAL},
+                    {"editor":{"login":"sample-bot"},"previousVersion":""},
+                ]),
+            ),
+        ] {
+            let transport = Offline::new(vec![response(&ticked, history)]);
+            let result = execute(&transport, &target(), None, 0, Operation::Read, false)
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let changes = result.output["changes"].as_array().unwrap();
+            let tick = changes.first().map(|c| {
+                (
+                    c["id"].as_str().unwrap().to_owned(),
+                    c["ticked"].as_array().unwrap().len(),
+                )
+            });
+            assert_eq!(
+                (changes.len(), tick),
+                (1, Some(("D12".into(), 1))),
+                "{name}: {}",
+                result.output
+            );
+        }
+    }
+
+    #[test]
     fn resolution_ignores_fenced_done_heading() {
         for fence in ["```", "~~~"] {
             let body =

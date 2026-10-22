@@ -669,6 +669,54 @@ mod tests {
             why.contains("could not read (GitHub transport failed)"),
             "{why}"
         );
+        // AUDIT: a run list past one page (per_page=100, `Link: rel="next"`,
+        // total_count above the page) is taken as complete, so an implement run
+        // beyond the page is not waited for: the record then says
+        // "Run independently: no open pull request ... changes a path it names".
+        struct Truncated;
+        impl Transport for Truncated {
+            fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+                if query == PULLS_QUERY {
+                    return Ok(json!({"repository": {"pullRequests": {"nodes": []}}}));
+                }
+                assert_eq!(query, TEXT_QUERY);
+                // Both the issue and the run in flight name a.rs.
+                let body = match variables["number"].as_u64() {
+                    Some(10) | Some(11) => "Fix src/a.rs.",
+                    _ => "Nothing named.",
+                };
+                Ok(json!({"repository": {"issue": {"title": "T", "body": body}}}))
+            }
+        }
+        impl Rest for Truncated {
+            fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+                let (runs, link): (Vec<Value>, Option<String>) = if url.contains("status=in_progress") {
+                    (
+                        (1000..1100)
+                            .map(|n| json!({"display_title": format!("implement example/work#{n}")}))
+                            .collect(),
+                        Some("<https://api.github.com/x?page=2>; rel=\"next\"".into()),
+                    )
+                } else {
+                    (vec![], None)
+                };
+                Ok(RestResponse {
+                    status: 200,
+                    etag: None,
+                    last_modified: None,
+                    link,
+                    body: json!({"total_count": runs.len() + 1, "workflow_runs": runs}),
+                })
+            }
+            fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
+                panic!("unexpected {method} {url}")
+            }
+        }
+        let decision = decide(&Truncated, &issue, &issue, "Do it.", bot, &target);
+        assert!(
+            !matches!(&decision, Decision::Independent(why) if why.starts_with("no open pull request")),
+            "a run list cut at one page is not evidence of no overlap: {decision:?}"
+        );
         let many = format!(
             "open pull request example/work#5 changes {}",
             shown(&["a/1.rs", "a/2.rs", "a/3.rs", "a/4.rs"].map(String::from))

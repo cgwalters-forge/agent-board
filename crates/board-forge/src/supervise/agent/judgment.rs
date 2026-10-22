@@ -474,7 +474,7 @@ fn run_id(url: &str, p: &Policy) -> Result<u64> {
     id.parse().context("Malformed triage run ID")
 }
 
-fn triage_answer_done(body: &str) -> bool {
+pub(super) fn triage_answer_done(body: &str) -> bool {
     // Match tracker's .github/poll/schedule.cjs readTriage VERDICT_RE:
     // column-zero, case-sensitive fences, optional horizontal whitespace,
     // exactly one complete block, JSON with a done verdict. The named run

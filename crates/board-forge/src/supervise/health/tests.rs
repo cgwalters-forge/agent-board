@@ -1022,3 +1022,79 @@ fn the_collector_has_a_bounded_request_budget_and_writes_nothing() {
     );
     assert!(bounded.graphql("mutation { x }", json!({})).is_err());
 }
+
+// ---- audit candidates ----
+
+#[test]
+fn audit_poll_streak_is_not_broken_by_a_cancelled_run() {
+    let (_, now) = recorded();
+    let f = json!({"status": "completed", "conclusion": "failure"});
+    let c = json!({"status": "completed", "conclusion": "cancelled"});
+    // Every run that ran failed; the cancelled one never ran (as passes() says).
+    assert_eq!(
+        status("poll", json!([f, c, f, f]), now),
+        "fail",
+        "a cancelled run between failures hides the streak"
+    );
+}
+
+#[test]
+fn audit_probe_in_progress_or_cancelled_is_not_a_failed_probe() {
+    let (s, now) = recorded();
+    let good = json!({"status": "completed", "conclusion": "success", "updated_at": s["now"]});
+    let running = json!({"status": "in_progress", "conclusion": null, "updated_at": s["now"]});
+    assert_eq!(
+        status("broker", json!([running, good.clone()]), now),
+        "ok",
+        "a probe still running is not a failed probe"
+    );
+    let cancelled = json!({"status": "completed", "conclusion": "cancelled", "updated_at": s["now"]});
+    assert_eq!(
+        status("broker", json!([cancelled, good]), now),
+        "ok",
+        "a probe cancelled while waiting is not a failed probe"
+    );
+}
+
+#[test]
+fn audit_dispatch_does_not_count_the_runs_own_pull_request() {
+    let (_, now) = recorded();
+    let s = project_settings();
+    let root = format!("/repos/{}", s.dispatch_repo);
+    let started = iso(now - 20 * 60_000);
+    let opened = iso(now - 60_000);
+    let fake = Fake::new(|_: &str, path: &str, _: &Value| -> Result<Value> {
+        if path.starts_with(&format!("{root}/actions/workflows/dispatch.yml/runs?status=in_progress")) {
+            return Ok(json!({"workflow_runs": [{"id": 60, "display_title": "implement example/project#9 (claude)",
+                "status": "in_progress", "conclusion": null, "created_at": started, "run_started_at": started,
+                "html_url": "https://github.com/example/control/actions/runs/60"}]}));
+        }
+        if path == "/repos/example/project/issues/9" {
+            return Ok(json!({"number": 9, "state": "open", "labels": []}));
+        }
+        if path.starts_with("/repos/example/project/issues/9/sub_issues") {
+            return Ok(json!([]));
+        }
+        if path.starts_with("/repos/example/project/issues/9/timeline") {
+            // The run's own pull request, opened by its apply step a minute ago.
+            return Ok(json!([{"event": "cross-referenced", "created_at": opened,
+                "source": {"type": "issue", "issue": {"number": 12, "state": "open", "created_at": opened,
+                    "pull_request": {"url": "https://api.github.com/repos/example/project/pulls/12"}}}}]));
+        }
+        bail!("not this check")
+    });
+    let c = Collector {
+        api: &fake,
+        s: &s,
+        branch: "main".into(),
+        now,
+        root: root.clone(),
+        cache: RefCell::new(HashMap::new()),
+    };
+    let items = c.dispatch().unwrap();
+    assert_eq!(
+        check(&with("dispatch", Some(items)), "dispatch", now)["status"],
+        "ok",
+        "the running implement run's own pull request is not duplicate work"
+    );
+}
