@@ -11,6 +11,10 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- An epic asked about that is not on the board is still commented on and
+  labelled, and no longer fails the pass on every run for having no Why to
+  set (docs/pass.md#what-is-built).
+
 - Stage 2 no longer reads a `needs-human` pull request that only a person
   could move, and takes a pull request's comments with its query: a replay of
   the board of 31 October spends 98 requests there, down from 173

@@ -1495,6 +1495,44 @@ fn retry_behind_the_focus_keeps_its_intro() {
     );
 }
 
+/// An epic not on the board, as tracker#783 was on 31 October, is listed from
+/// its repository all the same. With no Why to set it is still asked about,
+/// and that fails nothing: failing it left it unasked, and every pass red.
+#[test]
+fn epic_off_the_board_is_asked_without_a_why() {
+    let labels = "POST repos/cgwalters-forge/tracker/issues/596/labels";
+    let comments = "POST repos/cgwalters-forge/tracker/issues/596/comments";
+    type Case<'a> = (&'a str, fn(&mut Replay), Vec<&'a str>);
+    let cases: Vec<Case> = vec![
+        ("every sub-issue closed", |_| {}, vec![comments, labels]),
+        ("no plan twice", retried, vec![labels]),
+    ];
+    for (name, edit, expected) in cases {
+        let mut replay = replay();
+        edit(&mut replay);
+        let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 596,
+            "field": WHY_FIELD});
+        replay.requests.push(json!({
+            "request": graphql_key(WHY_QUERY, &variables),
+            "answer": {"data": {"repository": {"issue": {"projectItems": {"nodes": [],
+                "totalCount": 0}}}}},
+        }));
+        let forge = Forge::new(replay);
+        let report = local_with(&forge, 3, json!({}));
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let line = (report.lines.iter())
+            .find(|l| l.starts_with("hold epic cgwalters-forge/tracker#596: "))
+            .unwrap_or_else(|| panic!("{name}: {:#?}", report.lines));
+        assert!(line.ends_with(&format!("; {OFF_BOARD}")), "{name}: {line}");
+        let writes = forge.writes.borrow();
+        let made: Vec<&str> = (writes.iter())
+            .map(|(w, _)| w.as_str())
+            .filter(|w| w.contains("/596"))
+            .collect();
+        assert_eq!(made, expected, "{name}");
+    }
+}
+
 /// An applying pass holds tracker#596, whose retried planning request got
 /// no plan either, for the operator: it labels it needs-human and sets its
 /// Why to the question, both or, past --max-writes, neither.

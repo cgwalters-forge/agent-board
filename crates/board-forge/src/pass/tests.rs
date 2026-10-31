@@ -5076,6 +5076,12 @@ fn apply_reruns_a_failed_run_once() {
         );
     };
     let transient_17: Edit = |r| target_17(r, "GitHub GraphQL: connection reset");
+    // tracker#103's plan named bootc#103, which does not exist.
+    let missing_17: Edit = |r| {
+        let error = "GitHub GraphQL: NOT_FOUND: Could not resolve to an Issue with the number of 17.; response may be partial";
+        target_17(r, error);
+        r.requests.last_mut().unwrap()["answer"] = json!({"error": error});
+    };
     let triage: Edit = |r| replan_468(r, r#""kind":"implement","#, r#""kind":"triage","#);
     // The recording's open tracker#889 changes paths its plan names: the
     // rerun waits for it, as a start would. Without it, it is re-run.
@@ -5156,6 +5162,14 @@ fn apply_reruns_a_failed_run_once() {
             vec![run(1)],
             transient_17,
             "hold cgwalters-forge/tracker#468: its plan's cgwalters-forge/tracker#17 could not be read: GitHub GraphQL: connection reset",
+            0,
+        ),
+        (
+            "one whose target does not exist is held, and fails nothing",
+            json!({"reruns": true}),
+            vec![run(1)],
+            missing_17,
+            "hold cgwalters-forge/tracker#468: its plan's cgwalters-forge/tracker#17 could not be read: GitHub GraphQL: NOT_FOUND",
             0,
         ),
         (
@@ -8193,6 +8207,32 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
             assert!(report.lines.iter().any(|l| l == overlap), "limit {limit}");
         }
     }
+}
+
+/// The live pass of 31 October: the sweep meets the reserve too, says so,
+/// and fails nothing either.
+#[test]
+fn apply_defers_the_sweep_when_its_budget_runs_out() {
+    let swept = config(sweep_settings());
+    let issues = [
+        "cgwalters-forge/tracker#446",
+        "cgwalters-forge/tracker#459",
+        "cgwalters-forge/tracker#533",
+    ];
+    let mut deferred = 0;
+    // Below these it stops before any candidate, the one stop that fails.
+    for limit in 100..=200 {
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &issues);
+        silent(&mut forge.replay, &[], &[]);
+        sweep_listing(&mut forge.replay, json!([]));
+        let report = apply_within(&forge, &swept, limit);
+        if (report.lines.iter()).any(|l| l.starts_with("sweep: budget: ")) {
+            deferred += 1;
+            assert_eq!(report.failures, 0, "limit {limit}: {:#?}", report.lines);
+        }
+    }
+    assert!(deferred > 0, "no limit deferred the sweep");
 }
 
 /// Whatever the budget, stage 4 never finds a candidate ready and then
