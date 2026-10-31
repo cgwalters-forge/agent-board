@@ -12313,3 +12313,149 @@ fn focus_read(replay: &mut Replay, state: &str) {
         "answer": {"data": {"repository": {"issue": node}}},
     }));
 }
+
+/// An epic is planned again only for something it depends on. The recorded
+/// tracker#890 with its sub-issues as its receipt left them, on an idle pass
+/// (tracker#596 is done and tracker#766 held, so neither plans), and what
+/// happens to it since: a start, or the line that says why there is none.
+/// The bounded retry of a request with no plan, which needs no change, is
+/// [`epics`]'s tests' to replay.
+#[test]
+fn epic_replans_only_on_change() {
+    const COMMENTS: &str = r#""after":null,"name":"tracker","number":890,"#;
+    const UNCHANGED: &str = "epic cgwalters-forge/tracker#890: plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T13:42:20Z, so it is not planned again";
+    const PLANNING: &str = "start planning cgwalters-forge/tracker#890 pool=claude: ";
+    const CHANGED: &str = "its sub-issues changed (";
+    const EARLY: &str = "; early, with 6 slot(s) free and nothing started";
+    const DIRECTED: &str = "operator direction since it was last planned";
+    /// `author`'s comment on tracker#890, an hour before the recording.
+    fn says(replay: &mut Replay, author: &str, body: &str) {
+        let at = replay.now - time::Duration::hours(1);
+        let node = json!({"url": "https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-7000000099",
+            "body": body, "createdAt": at.format(&Rfc3339).unwrap(), "lastEditedAt": null,
+            "author": {"login": author}, "editor": null});
+        let comments = &mut answer(replay, COMMENTS)["data"]["repository"]["issue"]["comments"];
+        comments["nodes"].as_array_mut().unwrap().push(node);
+    }
+    type Edit = Box<dyn Fn(&mut Replay, &mut Value)>;
+    // What changed, and the planning why it starts with, or the line of no start.
+    type Case = (&'static str, Edit, Option<Vec<&'static str>>, &'static str);
+    let cases: Vec<Case> = vec![
+        ("unchanged", Box::new(|_, _| {}), None, UNCHANGED),
+        (
+            "a child closed: planned early, as agent-board#499 has it",
+            Box::new(|r, _| {
+                let subs = subs_mut(r, 890);
+                let open = (subs["nodes"].as_array_mut().unwrap().iter_mut())
+                    .find(|n| n["state"] == "OPEN")
+                    .unwrap();
+                open["state"] = "CLOSED".into();
+            }),
+            Some(vec![CHANGED, " closed", EARLY]),
+            "",
+        ),
+        (
+            "a child added: planned early",
+            Box::new(|r, _| {
+                let subs = subs_mut(r, 890);
+                let mut new = subs["nodes"][0].clone();
+                new["number"] = 9999.into();
+                new["state"] = "OPEN".into();
+                subs["nodes"].as_array_mut().unwrap().push(new);
+                subs["totalCount"] = subs["nodes"].as_array().unwrap().len().into();
+            }),
+            Some(vec![CHANGED, " added", EARLY]),
+            "",
+        ),
+        (
+            "the operator's comment: planned at once",
+            Box::new(|r, _| says(r, "cgwalters", "Do the docs next.")),
+            Some(vec![DIRECTED]),
+            "",
+        ),
+        (
+            "a visitor's comment spends nothing",
+            Box::new(|r, _| says(r, "visitor", "Do the docs next.")),
+            None,
+            UNCHANGED,
+        ),
+        (
+            "the bot's comment spends nothing",
+            Box::new(|r, _| says(r, "cgwalters-bot", "The run ended.")),
+            None,
+            UNCHANGED,
+        ),
+        (
+            "nor where the operator is the bot",
+            Box::new(|r, c| {
+                says(r, "cgwalters-bot", "The run ended.");
+                c["operator"] = "cgwalters-bot".into();
+                // Its epics are the bot's then, to be live.
+                for entry in &mut r.requests {
+                    let events = entry["answer"]
+                        .pointer_mut("/data/repository/issue/timelineItems/nodes")
+                        .and_then(Value::as_array_mut);
+                    for event in events.into_iter().flatten() {
+                        event["actor"]["login"] = "cgwalters-bot".into();
+                    }
+                }
+            }),
+            None,
+            UNCHANGED,
+        ),
+    ];
+    for (name, edit, planned, line) in cases {
+        let mut replay = replay();
+        only(&mut replay, &["cgwalters-forge/tracker#446"]);
+        settled_890(&mut replay);
+        let mut settings = json!({"triage": false});
+        edit(&mut replay, &mut settings);
+        let report = preview(&config(settings), &replay);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let start = (report.lines.iter()).find(|l| l.starts_with("start "));
+        match &planned {
+            Some(parts) => {
+                let start = start.unwrap_or_else(|| panic!("{name}: {:#?}", report.lines));
+                assert!(start.starts_with(PLANNING), "{name}: {start}");
+                for part in parts {
+                    assert!(start.contains(part), "{name}: {part} in {start}");
+                }
+            }
+            None => {
+                assert_eq!(start, None, "{name}: {:#?}", report.lines);
+                assert!(
+                    report.lines.iter().any(|l| l.starts_with(line)),
+                    "{name}: {line} in {:#?}",
+                    report.lines
+                );
+            }
+        }
+    }
+}
+
+/// tracker#890's recorded sub-issues as its receipt's fingerprint left them.
+fn settled_890(replay: &mut Replay) {
+    const MARKER: &str = "<!-- agent-board-epic-fingerprint: ";
+    let comments = &answer(replay, r#""after":null,"name":"tracker","number":890,"#)["data"]["repository"]
+        ["issue"]["comments"]["nodes"];
+    let body = (comments.as_array().unwrap().iter())
+        .map(|c| text(c, "/body"))
+        .find_map(|b| b.split_once(MARKER))
+        .map(|(_, rest)| rest.split_once(" -->").unwrap().0.to_owned())
+        .unwrap();
+    let pairs: Vec<(String, String)> = serde_json::from_str(&body).unwrap();
+    let subs = subs_mut(replay, 890);
+    let template = subs["nodes"][0].clone();
+    let nodes: Vec<Value> = (pairs.iter())
+        .map(|(issue, state)| {
+            let (repo, number) = issue.split_once('#').unwrap();
+            let mut node = template.clone();
+            node["repository"] = json!({"nameWithOwner": repo});
+            node["number"] = number.parse::<u64>().unwrap().into();
+            node["state"] = state.as_str().into();
+            node
+        })
+        .collect();
+    subs["totalCount"] = nodes.len().into();
+    subs["nodes"] = nodes.into();
+}

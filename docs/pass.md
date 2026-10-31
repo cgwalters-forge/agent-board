@@ -561,7 +561,14 @@ board Blocked) or with a planning run or request in flight is never one.
 Where stage 4 starts anything, the wait stands. Not noticed
 (agent-board#429): edits of the epic's or a sub-issue's text, label and
 Priority churn, and a comment by anyone but the operator, whose word alone
-decides an epic's plan.
+decides an epic's plan. The bot's comments never count, even where the
+operator and the bot are one login: the planner's report and the run's status
+comment would otherwise read as direction after every run. Such an operator
+moves an epic by replacing its plan, or once its last request is answered by
+changing its sub-issues; a comment does not move it, nor answer a completion ask,
+whose label they take off by hand. An idle pass
+with an unchanged epic starts nothing and logs why (`epic OWNER/REPO#N: plan ID
+applied; nothing changed since T, so it is not planned again`).
 
 A pending plan refused only because actions target currently closed sub-issues
 is stale: the pass asks for a fresh **whole** epic plan, without touching those
@@ -2024,8 +2031,10 @@ heads it planned, and never records one the run chose.
 ## Epic planning and recovery
 
 A live, unheld epic is due initially, after changed intent/operator direction
-or membership/state changes in its children, and never on a timer alone
-(agent-board#383); body, label and Priority changes in its children are
+or membership/state changes in its children since its last applied plan's
+receipt, and never on a timer alone (agent-board#383), so the early re-plan
+of an idle pass needs such a change too; only the retry below runs with none.
+Body, label and Priority changes in its children are
 churn, not demand (agent-board#429). Coalesce automatic changes for a day
 after a request, doubled for each applied plan in a row with no actions,
 up to `triageFollowUpDays`; new operator direction may bypass that

@@ -1869,14 +1869,14 @@ fn decide_coalesces_changes_but_not_direction() {
             &recorded,
             vec![nothing(1)],
             "2026-10-30T14:00:00Z",
-            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T14:00:00Z\")",
+            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T14:00:00Z, so it is not planned again\")",
         ),
         (
             &settled,
             &recorded,
             vec![],
             "2026-10-23T20:00:00Z",
-            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T13:42:20Z\")",
+            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T13:42:20Z, so it is not planned again\")",
         ),
         // Unchanged, it is not planned again a day or a week later.
         (
@@ -1884,7 +1884,7 @@ fn decide_coalesces_changes_but_not_direction() {
             &recorded,
             vec![],
             "2026-10-24T14:00:00Z",
-            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T13:42:20Z\")",
+            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T13:42:20Z, so it is not planned again\")",
         ),
         (
             &settled,
