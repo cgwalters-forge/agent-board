@@ -207,7 +207,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
 }
 
 /// When `stop` was posted, where it is among `comments`.
-fn stopped_at(stop: &Marker, comments: &[Value]) -> Option<OffsetDateTime> {
+pub(super) fn stopped_at(stop: &Marker, comments: &[Value]) -> Option<OffsetDateTime> {
     comments
         .iter()
         .find(|c| c["id"].as_u64() == stop.id)

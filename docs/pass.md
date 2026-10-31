@@ -2493,6 +2493,17 @@ labels than one query reads is left alone, as the poll waits on one otherwise. A
 on a stale stop counts as fix round 1, so a pull request gets at most one
 such round before it is closed, unless a person resets it. The round
 respects `--fix-bounds`, `--max-dispatch` and pacing like any other.
+
+A pull request labelled `needs-human` is otherwise only skipped, so the pass
+does not pay for it: one query per repository with such a pull request lists
+them, and only one with a conflict (or mergeability not known yet) or a change
+request, which a stale stop could act on, is read whole, as all of them are
+where that query fails. A pull request's comments come with its query, the REST
+list being read only past its last 100; that query reads the label too, not
+after the stop that needs-human writes after the label, so a stop less than a
+minute old with no label reads the label again. Together these took a replay
+of the board of 31 October from 173 requests to 98 in this stage.
+
 No additional poll optional switches are exposed in this initial pass schema;
 `poll` becomes this stage rather than a separate command, so the switches
 not listed here go with it at the cutover unless a need adds them.
