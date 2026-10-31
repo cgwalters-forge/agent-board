@@ -595,6 +595,9 @@ fn reported(comments: &[Comment], bot: &str, at: OffsetDateTime) -> Option<Strin
     Some(line.chars().take(REPORT_CHARS).collect())
 }
 
+/// Said of an epic asked about that has no board Why to ask in.
+const OFF_BOARD: &str = "it is not on the board, so it has no Why";
+
 /// What an epic needs now, from its comments and sub-issues alone, by the
 /// rules of docs/pass.md#what-is-built.
 pub(super) fn decide(i: &Inputs) -> Next {
@@ -1783,9 +1786,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             &json!({"labels": [NEEDS_HUMAN]}),
             0,
         )
-        .and_then(|_| board.map_or(Ok(()), |b| self.set_why(issue, b, question)));
+        .and_then(|_| board.map_or(Ok(true), |b| self.set_why(issue, b, question)));
         match sent {
-            Ok(()) => self.epic_held(facts, hold(why)),
+            Ok(true) => self.epic_held(facts, hold(why)),
+            Ok(false) => self.epic_held(facts, hold(format!("{why}; {OFF_BOARD}"))),
             Err(error) => {
                 self.report.failures += 1;
                 self.epic_held(facts, hold(format!("{why} failed: {error:#}")));
@@ -1934,18 +1938,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let sent = match close {
             true => comment(self).and_then(|()| {
                 let state = json!({"state": "closed", "state_reason": "completed"});
-                plan::send(&self.client, "PATCH", &url, &state, 0).map(drop)
+                plan::send(&self.client, "PATCH", &url, &state, 0).map(|_| true)
             }),
             false => board
-                .map_or(Ok(()), |b| self.set_why(issue, b, DONE_QUESTION))
-                .and_then(|()| comment(self))
-                .and_then(|()| {
+                .map_or(Ok(true), |b| self.set_why(issue, b, DONE_QUESTION))
+                .and_then(|on_board| {
+                    comment(self)?;
                     let labels = json!({"labels": [NEEDS_HUMAN]});
-                    plan::send(&self.client, "POST", &format!("{url}/labels"), &labels, 0).map(drop)
+                    plan::send(&self.client, "POST", &format!("{url}/labels"), &labels, 0)?;
+                    Ok(on_board)
                 }),
         };
         match sent {
-            Ok(()) => report(self, line),
+            Ok(true) => report(self, line),
+            Ok(false) => report(self, format!("{line}; {OFF_BOARD}")),
             Err(error) => {
                 self.report.failures += 1;
                 report(self, format!("{line} failed: {error:#}"));
@@ -1980,7 +1986,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     /// Sets `issue`'s Why on `board` to `text`, unless it is that already.
-    fn set_why(&self, issue: &ItemRef, board: &Board, text: &str) -> Result<()> {
+    /// Whether it is on `board` at all: an epic need not be, as the epics are
+    /// listed from their repository, and then has no Why to set.
+    fn set_why(&self, issue: &ItemRef, board: &Board, text: &str) -> Result<bool> {
         let (owner, name) = issue.repository.split_once('/').context("repository")?;
         let data = self.client.graphql(
             WHY_QUERY,
@@ -1994,9 +2002,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             items["totalCount"].as_u64() == Some(nodes.len() as u64),
             "not all of its boards could be read"
         );
-        let item = board_item(nodes, board).context("it is not on the board")?;
+        let Some(item) = board_item(nodes, board) else {
+            return Ok(false);
+        };
         if item.pointer("/why/text").and_then(Value::as_str) == Some(text) {
-            return Ok(());
+            return Ok(true);
         }
         let field = &item["project"]["field"];
         let id = (field["id"].as_str())
@@ -2013,7 +2023,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 == Some(item_id),
             "{WHY_FIELD} update receipt mismatch"
         );
-        Ok(())
+        Ok(true)
     }
 
     /// One planning run for a due epic, if this pass has started none: a

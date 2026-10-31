@@ -509,7 +509,9 @@ epics in Priority order, an [`epics.focus`](#scheduling) epic first. Its first l
   comments so and closes it as completed, two write steps held whole by
   `--max-writes`; else `hold epic …: every sub-issue is closed; why; label
   needs-human, Why Q: …` asks the operator, setting the question in its
-  board Why, then commenting and labelling it `needs-human`, three. Either
+  board Why, then commenting and labelling it `needs-human`, three. An epic
+  not on the board has no Why to set: the rest is done, the line ends `it is
+  not on the board, so it has no Why`, and that fails nothing. Either
   comment's hidden first line, `<!-- agent-board-epic-done: HASH -->`,
   hashes the sub-issues and their states, so it is said once for them
   (`epic …: every sub-issue is closed, as URL says`), the bot's alone
@@ -841,8 +843,8 @@ stops for a full WIP, with `budget: N requests left, only what a start may take
 (73); M more candidate(s) wait`, rather than read on into requests no start it
 found could use; the rest wait for the next pass, and the stop is a failure only
 when no candidate was considered. Revisits, the weekly sweep and blocker reads
-that meet the reserve wait too, saying so; none holds, labels or fails an item
-for it.
+that meet the reserve wait too, saying so (`sweep: budget: …`); none holds,
+labels or fails an item for it, nor fails the pass.
 Stage 5 and the hold snapshot, which come after every start, spend what is left. There is
 no second fill-page budget. Preview performs no forge writes or dispatches and
 does not change the apply cache.
