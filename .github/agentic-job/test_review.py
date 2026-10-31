@@ -109,13 +109,37 @@ class ReviewContracts(unittest.TestCase):
                 )
                 self.assertEqual(checked.returncode, 0 if set(results) == {"success"} else 1)
 
-    def test_ci_uses_the_current_ubuntu_vm_runner(self):
-        ci = (ROOT / ".github/workflows/ci.yml").read_text().split("\njobs:\n", 1)[1]
-        jobs = re.findall(r"^  (\w+):\n(.*?)(?=^  \w+:|\Z)", ci, re.MULTILINE | re.DOTALL)
-        self.assertEqual([name for name, _ in jobs], ["specs", "rust", "forgejo", "lint", "ci"])
-        for name, job in jobs:
-            with self.subTest(job=name):
-                self.assertEqual(re.findall(r"^    runs-on: (.+)$", job, re.MULTILINE), ["ubuntu-26.04"])
+    def test_runner_maintenance_uses_only_the_published_preset(self):
+        config = json.loads((ROOT / ".github/renovate.json").read_text())
+        # No local rules, second preset, action-pin updates or automerge.
+        self.assertEqual(config, {
+            "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+            "extends": ["github>cgwalters-forge/actions//renovate/runners"],
+        })
+
+    def test_owned_workflows_use_the_current_ubuntu_vm_runner(self):
+        # Only directly owned jobs: reusable providers own their runners.
+        # An intentional special runner belongs in this per-job map, not in
+        # a blanket replacement of every runs-on value (see docs/setup.md).
+        expected = {
+            "ci": dict.fromkeys(("specs", "rust", "forgejo", "lint", "ci"), "ubuntu-26.04"),
+            "site": dict.fromkeys(("check", "deploy"), "ubuntu-26.04"),
+            "reconcile": {"propose": "ubuntu-26.04", "apply": None},
+            "review": {"review": None},
+        }
+        self.assertEqual(
+            {path.stem for path in (ROOT / ".github/workflows").glob("*.yml")}, set(expected),
+        )
+        for workflow, runners in expected.items():
+            content = (ROOT / f".github/workflows/{workflow}.yml").read_text().split("\njobs:\n", 1)[1]
+            jobs = re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", content, re.MULTILINE | re.DOTALL)
+            self.assertEqual([name for name, _ in jobs], list(runners))
+            for name, job in jobs:
+                with self.subTest(workflow=workflow, job=name):
+                    runner = runners[name]
+                    self.assertEqual(re.findall(r"^    runs-on: (.+)$", job, re.MULTILINE), [runner] if runner else [])
+                    if runner is None:
+                        self.assertRegex(job, r"(?m)^    uses: cgwalters-forge/.*@")
 
     def test_ci_runs_the_shared_workflow_check(self):
         # Through the Justfile, beside a checkout of the shared actions at
