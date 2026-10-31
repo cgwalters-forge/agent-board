@@ -26,6 +26,11 @@ const WRITE_REQUESTS: usize = 12;
 const RECEIPT_BODY_LIMIT: usize = 15_900;
 /// The full question/reason remains in the reply; receipts are only a summary.
 const LEFT_LINE_LIMIT: usize = 140;
+/// Finding the sweep issue reads at most this share of the requests the
+/// pass has left, in pages: the rest is for stage 4's work and the sweep's.
+const DISCOVERY_SHARE: usize = 2;
+/// Reads of an attach's issue and thread before a refusal is kept.
+const THREAD_READS: usize = 2;
 
 /// An issue's label names.
 fn names(issue: &Value) -> Result<Vec<String>> {
@@ -53,6 +58,44 @@ fn unavailable(error: &anyhow::Error) -> bool {
         || error
             .downcast_ref::<crate::forgejo::AuthenticationRequired>()
             .is_some()
+}
+
+/// A transport that notes whether any of its requests failed. A thread
+/// read's error with none failed is the shared validation's refusal of what
+/// it read, which no retry changes; one with a failed request is the
+/// transport's or the pass budget's, which a later pass retries.
+struct Noting<'a, T> {
+    inner: &'a T,
+    failed: Cell<bool>,
+}
+
+impl<T: ForgejoTransport> ForgejoTransport for Noting<'_, T> {
+    fn get(&self, url: &url::Url) -> Result<crate::forgejo::Response> {
+        let response = self.inner.get(url);
+        self.failed.set(self.failed.get() || response.is_err());
+        response
+    }
+}
+
+/// An item's issue and thread, or why the item is left for the operator.
+type Thread = std::result::Result<(Value, Vec<Value>), String>;
+
+/// Sanitizes `line` for the receipt: one line, no backticks, so that agent
+/// text cannot open a fence, at most [`LEFT_LINE_LIMIT`] characters. Each
+/// left line starts `- `, so a `~~~` in it opens no fence either.
+fn receipt_line(line: &str) -> String {
+    let flat: String = (line.chars())
+        .map(|c| match c {
+            '`' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let mut short: String = flat.chars().take(LEFT_LINE_LIMIT).collect();
+    if flat.chars().count() > LEFT_LINE_LIMIT {
+        short.push('…');
+    }
+    short
 }
 
 /// The listed issues of the sweep issue `number`'s list record: the bot's
@@ -113,7 +156,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
     /// else the newest it filed since this week's due time: posted by the
     /// bot's id, its body starting with the marker. Each listing is read
     /// whole, or the sweep errs: one could hide past it, and another would
-    /// be filed.
+    /// be filed. However many pages that takes, within the pass's request
+    /// and time bounds and a [`DISCOVERY_SHARE`] of the requests left.
     pub(super) fn find_sweep(&self) -> Result<Option<Found>> {
         let config = self.config;
         let Some(sweep) = &config.sweep else {
@@ -122,6 +166,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let repository = sweep.repository(config)?;
         let due = sweep.due(self.now)?;
         let since = shared::stamp(due);
+        // Pages both listings may still read together.
+        let mut left = self.client.bounds.left.get() / DISCOVERY_SHARE;
         for state in ["open", "all"] {
             let mut query = vec![
                 ("type", "issues"),
@@ -133,11 +179,30 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 query.push(("since", since.as_str()));
             }
             let url = api(self.board, repository, "issues", &query)?;
-            let (issues, whole) = pages(url, LIST_PAGES, |url| listing(self.client, url))?;
+            let cap = left;
+            let mut read = 0;
+            let (issues, whole) = pages(url, cap, |url| {
+                let (items, total) = listing(self.client, url)?;
+                read += 1;
+                // What the first page's count says is more than the cap is
+                // not read on: this pass would not read it whole.
+                if read == 1
+                    && let Some(total) = total
+                    && !items.is_empty()
+                {
+                    let needed = total.div_ceil(items.len() as u64);
+                    ensure!(
+                        needed <= cap as u64,
+                        "the bot's {state} issues in {repository} are {total}, {needed} pages, more than the {cap} this pass may read; no sweep is filed or started"
+                    );
+                }
+                Ok((items, total))
+            })?;
             ensure!(
                 whole,
-                "the bot's {state} issues in {repository} are more than {LIST_PAGES} pages; no sweep is filed or started"
+                "the bot's {state} issues in {repository} were not read whole in {cap} pages; no sweep is filed or started"
             );
+            left -= read;
             let mut newest: Option<Found> = None;
             for issue in &issues {
                 if issue["user"]["id"].as_u64() != Some(self.ids.bot)
@@ -189,6 +254,42 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             issue.repository,
             issue.number
         )
+    }
+
+    /// The issue and whole thread of `issue` for an apply, by stage 3's
+    /// reader and its validation: an error where a request failed, which a
+    /// later pass retries, else why the item is left for the operator. A
+    /// refusal is read again first, [`THREAD_READS`] in all: a comment
+    /// posted between the issue's read and its thread's is refused once.
+    fn sweep_thread(&self, issue: &IssueRef) -> Result<Thread> {
+        let at = self.write_identity(&self.item(issue));
+        let forge = self.epic_forge();
+        let noting = Noting {
+            inner: forge.transport,
+            failed: Cell::new(false),
+        };
+        let reader = crate::forgejo::Forgejo {
+            transport: &noting,
+            config: forge.config,
+        };
+        let mut refused = String::new();
+        for _ in 0..THREAD_READS {
+            noting.failed.set(false);
+            match reader.issue_thread(&at) {
+                Ok(read) => return Ok(Ok(read)),
+                Err(error) if error.downcast_ref::<NotFound>().is_some() => {
+                    return Ok(Err("not found".into()));
+                }
+                Err(error) if unavailable(&error) => {
+                    return Ok(Err(format!("its records cannot be used: {error:#}")));
+                }
+                Err(error) if noting.failed.get() => {
+                    return Err(error).with_context(|| format!("reading {issue}'s records"));
+                }
+                Err(error) => refused = format!("its records cannot be used: {error:#}"),
+            }
+        }
+        Ok(Err(refused))
     }
 
     /// The labels of `issue` as read now, as a label write compares them.
@@ -326,6 +427,16 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         if matches!(self.mode, Mode::Preview) {
             self.caps.count_many(Kind::Write, 2);
             self.line(format!("{line}; a preview files nothing"));
+            return Ok(());
+        }
+        // An issue filed without its record waits for a person.
+        let bounds = self.client.bounds;
+        let needed = 2 * WRITE_REQUESTS;
+        if bounds.left.get() < needed + WRITE_RESERVE || Instant::now() > bounds.admit_by {
+            self.line(format!(
+                "{line}: the pass has {} requests left, fewer than filing may take ({needed}), or ran out of time; it waits",
+                bounds.left.get()
+            ));
             return Ok(());
         }
         let issues: Vec<String> = outside.iter().map(|f| f.issue.display()).collect();
@@ -536,20 +647,26 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
 
     /// Only the pass's first, unclaimed start may be resumed. Runs post as
     /// the bot too: a later plan must never become another dispatch path.
+    /// Only recorders' comments count, as claims and plans do: anyone else's
+    /// marker or fence neither proves nor blocks a start.
     pub(super) fn sweep_start_record(
         &self,
         issue: &ItemRef,
         thread: &[Value],
         accepted: Option<&Accepted>,
     ) -> bool {
-        if thread.iter().any(|c| {
+        let recorded = || {
+            (thread.iter()).filter(|c| {
+                (c["user"]["id"].as_u64()).is_some_and(|id| self.board.recorders.contains(&id))
+            })
+        };
+        if recorded().any(|c| {
             let body = text(c, "/body");
             marked(body, plan::DISPATCH_MARKER).is_some() || marked(body, RECEIPT_MARKER).is_some()
         }) {
             return false;
         }
-        let plans: Vec<_> = thread
-            .iter()
+        let plans: Vec<_> = recorded()
             .filter(|c| plan::has_fence(text(c, "/body"), PLAN_FENCE))
             .collect();
         let Some(accepted) = accepted else {
@@ -756,7 +873,6 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         verdicts: &[(ItemRef, Verdict)],
         recovering: bool,
     ) -> Result<(Applying, Epics)> {
-        let forge = self.epic_forge();
         let bot = self.ids.bot;
         let sweep = &found.issue.repository;
         let mut out = Applying::default();
@@ -803,20 +919,11 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 repo: issue.repository.clone(),
                 number: issue.number,
             };
-            let item = self.write_identity(&self.item(&child));
-            let (value, thread) = match forge.issue_thread(&item) {
+            let (value, thread) = match self.sweep_thread(&child)? {
                 Ok(read) => read,
-                Err(error) if error.downcast_ref::<NotFound>().is_some() => {
-                    out.left.push(format!("- {name}, not found: {}", said()));
+                Err(why) => {
+                    out.left.push(format!("- {name}, {why}: {}", said()));
                     continue;
-                }
-                Err(error) if unavailable(&error) => {
-                    out.left
-                        .push(format!("- {name}: its records cannot be read: {error:#}"));
-                    continue;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("reading {name}'s records"));
                 }
             };
             // Settled since: the operator closed it.
@@ -829,25 +936,23 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             };
             let to = epic.to_string().to_ascii_lowercase();
             if !epics.contains_key(&to) && !unreadable.contains_key(&to) {
-                let at = self.write_identity(&self.item(&epic));
-                match forge.issue_thread(&at) {
-                    Ok((value, thread)) if value["state"] == "open" => {
-                        epics.insert(
-                            to.clone(),
-                            (
-                                names(&value)?,
-                                relations::children(&thread, bot, epic.number)?,
-                            ),
-                        );
+                let read = match self.sweep_thread(&epic)? {
+                    Ok((value, _)) if value["state"] != "open" => {
+                        Err("the epic is not open".to_owned())
                     }
-                    Ok(_) => {
-                        unreadable.insert(to.clone(), "the epic is not open".into());
+                    Ok((value, thread)) => names(&value)
+                        .and_then(|labels| {
+                            Ok((labels, relations::children(&thread, bot, epic.number)?))
+                        })
+                        .map_err(|error| format!("its records cannot be used: {error:#}")),
+                    Err(why) => Err(why),
+                };
+                match read {
+                    Ok(read) => {
+                        epics.insert(to.clone(), read);
                     }
-                    Err(error) if unavailable(&error) => {
-                        unreadable.insert(to.clone(), format!("{error:#}"));
-                    }
-                    Err(error) => {
-                        return Err(error).with_context(|| format!("reading epic {epic}"));
+                    Err(why) => {
+                        unreadable.insert(to.clone(), why);
                     }
                 }
             }
@@ -1070,6 +1175,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             "The board pass {outcome} [this sweep's verdicts]({}#issuecomment-{reply_id}).\n",
             found.url
         );
+        // Done lines name only validated issues; left lines carry the
+        // reply's reasons and questions, and read errors.
         if !plan.done.is_empty() {
             body.push_str(&format!("\n{}\n", plan.done.join("\n")));
         }
@@ -1077,15 +1184,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             body.push_str(&format!(
                 "\nFor {}, who closes this issue once they are settled:\n\n{}\n",
                 self.config.operator,
-                plan.left
-                    .iter()
-                    .map(|line| {
-                        let mut short: String = line.chars().take(LEFT_LINE_LIMIT).collect();
-                        if line.chars().count() > LEFT_LINE_LIMIT {
-                            short.push('…');
-                        }
-                        short
-                    })
+                (plan.left.iter())
+                    .map(|line| receipt_line(line))
                     .collect::<Vec<_>>()
                     .join("\n")
             ));
