@@ -11,6 +11,11 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Stage 2 no longer reads a `needs-human` pull request that only a person
+  could move, and takes a pull request's comments with its query: a replay of
+  the board of 31 October spends 98 requests there, down from 173
+  (docs/pass.md#one-configuration-file).
+
 - Optional native Forgejo revisits after normal stage 4 work, using bounded
   issue/comment reads, shared seeded sampling and the existing claim, lease,
   start and recovery path. Off by default, with no caller activation;

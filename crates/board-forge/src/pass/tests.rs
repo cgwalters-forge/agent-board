@@ -9884,6 +9884,141 @@ fn followed(replay: &mut Replay, (repo, number): (&str, u64), change: Value, com
     }
 }
 
+/// [`followed`]'s agentic-job#9 labelled `needs-human` in the open list and
+/// its query, and that query's answer.
+fn followed_labelled(replay: &mut Replay, settings: &mut Value, pr: Value) {
+    let repo = "cgwalters-forge/agentic-job";
+    let labels = json!({"nodes": [{"name": "needs-human"}], "pageInfo": {"hasNextPage": false}});
+    followed(replay, (repo, 9), json!({"labels": labels}), json!([]));
+    settings["follow"] = json!([repo]);
+    settings["pr"] = pr;
+    let list = format!("{API_ROOT}repos/{repo}/pulls?state=open");
+    let open = replay.requests.iter_mut().rfind(|e| {
+        e["request"]["get"]
+            .as_str()
+            .is_some_and(|url| url.starts_with(&list))
+    });
+    open.unwrap()["answer"]["body"][0]["labels"] = json!([{"name": "needs-human"}]);
+}
+
+/// A labelled pull request the pass would only skip takes no read of its own,
+/// here with none recorded, so that one read whole says so as an error; one a
+/// stale stop could act on is read whole.
+#[test]
+fn labelled_pull_requests_are_read_only_to_act_on() {
+    const LINE: &str = "cgwalters-forge/agentic-job#9 abc skip: labelled needs-human";
+    const READ: &str = "cgwalters-forge/agentic-job#9 error: ";
+    let requested = json!({"nodes": [{"state": "CHANGES_REQUESTED", "submittedAt": "2026-10-20T00:00:00Z"}],
+        "pageInfo": {"hasPreviousPage": false}});
+    let whole = json!({"nodes": [], "pageInfo": {"hasPreviousPage": false}});
+    let past = json!({"nodes": [], "pageInfo": {"hasPreviousPage": true}});
+    let stale = json!({"fixPools": ["claude"], "staleDays": 2});
+    // Its `pr`, what the list query answers, and the start of its line.
+    type Case<'a> = (&'a str, Value, Option<(&'a str, &'a Value)>, &'a str);
+    #[rustfmt::skip]
+    let cases: Vec<Case> = vec![
+        ("nothing stale could act on", stale.clone(), Some(("MERGEABLE", &whole)), LINE),
+        ("a conflict without staleDays", json!({"fixPools": ["claude"]}), Some(("CONFLICTING", &requested)), LINE),
+        ("a conflict", stale.clone(), Some(("CONFLICTING", &whole)), READ),
+        ("mergeability not known yet", stale.clone(), Some(("UNKNOWN", &whole)), READ),
+        ("a change request", stale.clone(), Some(("MERGEABLE", &requested)), READ),
+        ("reviews past the page", stale.clone(), Some(("MERGEABLE", &past)), READ),
+        ("the query fails", stale.clone(), None, READ),
+    ];
+    for (name, pr, listed, want) in cases {
+        let (mut replay, mut settings) = (replay(), json!({}));
+        followed_labelled(&mut replay, &mut settings, pr);
+        replay
+            .requests
+            .retain(|e| e["request"]["graphql"] != fnv(poll::PULL_QUERY));
+        if let Some((mergeable, reviews)) = listed {
+            let variables = json!({"owner": "cgwalters-forge", "name": "agentic-job",
+                "label": "needs-human", "pulls": 100});
+            let node = json!({"number": 9, "headRefOid": "abc", "mergeable": mergeable,
+                "commits": {"nodes": [{"commit": {"committedDate": "2026-10-20T00:00:00Z"}}]},
+                "reviews": reviews});
+            replay.requests.push(json!({
+                "request": graphql_key(poll::LABELLED_QUERY, &variables),
+                "answer": {"data": {"repository": {"pullRequests": {"nodes": [node]}}}},
+            }));
+        }
+        let report = preview(&config(settings), &replay);
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(want)),
+            "{name}: {:#?}",
+            report.lines
+        );
+        assert_eq!(report.failures, usize::from(want == READ), "{name}");
+    }
+}
+
+/// A pull request's comments come with its query, the REST list only past its
+/// page; a stop with no label reads the label again while the stop is new.
+#[test]
+fn pull_request_comments_come_with_its_query() {
+    const FIRST: &str = "cgwalters-forge/agentic-job#9 abc ";
+    let marker = |state: Value| format!("<!-- {}: {state} -->\nA note.", poll::MARKER);
+    let bot = json!({"__typename": "User", "login": "cgwalters-bot"});
+    let app = json!({"__typename": "Bot", "login": "cgwalters-bot"});
+    let round = marker(json!({"rounds": 1, "sha": "abc", "run": 77}));
+    let stop = marker(json!({"rounds": 1, "sha": "abc", "stopped": true}));
+    let hours = |n: i64| {
+        let at = replay().now - time::Duration::hours(n);
+        at.format(&Rfc3339).unwrap()
+    };
+    type Comment<'a> = (&'a Value, &'a str, String);
+    // Its comments, whether there are more, the requests past those with
+    // none, and the start of the line for #9.
+    type Case<'a> = (&'a str, Vec<Comment<'a>>, bool, usize, &'a str);
+    #[rustfmt::skip]
+    let cases: Vec<Case> = vec![
+        ("none", vec![], false, 0, FIRST),
+        ("more than a query reads", vec![], true, 1, FIRST),
+        ("a round's marker, whose run it then reads",
+            vec![(&bot, &round, hours(1))], false, 1, "cgwalters-forge/agentic-job#9 error: "),
+        ("an app of the bot's name writes no marker", vec![(&app, &round, hours(1))], false, 0, FIRST),
+        ("a stop since reset takes no second read", vec![(&bot, &stop, hours(1))], false, 0, FIRST),
+        ("a stop just made may not have its label yet",
+            vec![(&bot, &stop, replay().now.format(&Rfc3339).unwrap())], false, 1, FIRST),
+    ];
+    let requests = |comments: &[Comment], more: bool, rest: bool| {
+        let (mut replay, mut settings) = (replay(), json!({"wip": 2}));
+        followed_draft(&mut replay, &mut settings);
+        settings["pr"] = json!({"fixPools": ["claude"]});
+        let nodes: Vec<Value> = (comments.iter().enumerate())
+            .map(|(id, (author, body, at))| {
+                json!({"fullDatabaseId": (id + 1).to_string(), "author": author, "body": body,
+                    "createdAt": at, "updatedAt": at})
+            })
+            .collect();
+        let query = json!(fnv(poll::PULL_QUERY));
+        let recorded = (replay.requests.iter_mut())
+            .find(|e| e["request"]["graphql"] == query)
+            .unwrap();
+        recorded["answer"]["data"]["repository"]["pullRequest"]["comments"] =
+            json!({"nodes": nodes, "pageInfo": {"hasPreviousPage": more}});
+        if !rest {
+            let list = "issues/9/comments";
+            replay.requests.retain(|e| {
+                !e["request"]["get"]
+                    .as_str()
+                    .is_some_and(|url| url.contains(list))
+            });
+        }
+        preview(&config(settings), &replay)
+    };
+    let base = requests(&[], false, false).spent.requests;
+    for (name, comments, more, extra, line) in cases {
+        let report = requests(&comments, more, more);
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(line)),
+            "{name}: {:#?}",
+            report.lines
+        );
+        assert_eq!(report.spent.requests, base + extra, "{name}");
+    }
+}
+
 /// 23 October, live: a pass whose published snapshot was stale refused
 /// every pull request's continuation, though it read the broker fresh in the
 /// same pass. Stage 2 now paces by stage 1's reading, so the continuation

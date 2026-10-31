@@ -46,7 +46,7 @@ const EVENTS_PAGE: usize = 100;
 pub const POLL_DISPATCH_LIMIT: usize = 3;
 
 // The protocol poll.cjs shares with dispatch.yml and fix.toml in the tracker.
-const MARKER: &str = "tracker-poll";
+pub(crate) const MARKER: &str = "tracker-poll";
 #[cfg(test)]
 pub(crate) use tests::conflict_stop_fixture;
 /// This poll's own: the claim a pass posts before it starts a fix round.
@@ -282,6 +282,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
       author { __typename login }
       headRepositoryOwner { login }
       labels(first: 50) { nodes { name } pageInfo { hasNextPage } }
+      comments(last: 100) { nodes { fullDatabaseId author { __typename login } body createdAt updatedAt } pageInfo { hasPreviousPage } }
       closingIssuesReferences(first: 10) { nodes { number repository { nameWithOwner } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } pageInfo { hasNextPage } }
       autoMergeRequest { enabledAt }
       mergeQueueEntry { state }
@@ -297,6 +298,23 @@ pub(crate) const PULL_QUERY: &str = concat!(
   }
 }"#
 );
+
+/// What one list query says of a repository's open pull requests labelled
+/// [`LABEL`], so that those the pass would only skip take no reads of their
+/// own ([`Pass::left_labelled`]).
+pub(crate) const LABELLED_QUERY: &str = r#"query($owner: String!, $name: String!, $label: String!, $pulls: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, labels: [$label], first: $pulls) {
+      nodes { number headRefOid mergeable commits(last: 1) { nodes { commit { committedDate } } }
+        reviews(last: 100) { nodes { state submittedAt } pageInfo { hasPreviousPage } } }
+    }
+  }
+}"#;
+/// Labelled pull requests one list query reads; any past them are read whole.
+const LABELLED_READS: u64 = 100;
+/// How far a stop's comment may be from the label written before it: another
+/// pass's stop newer than this may not have its label on yet.
+const STOP_WRITES_SECONDS: i64 = 60;
 
 /// The rest of a head's checks, a page after `$after` (cgwalters-forge/agent-board#129):
 /// re-running a review adds a second set of check runs, which can take a pull
@@ -3439,6 +3457,30 @@ fn moved_at(pull: &Value) -> Option<OffsetDateTime> {
     committed.max(reviewed)
 }
 
+/// Whether a labelled pull request as [`LABELLED_QUERY`] read it could be one
+/// [`Pass::stale`] acts on: it conflicts, or may, or has a change request.
+fn may_be_stale(listed: &Value) -> bool {
+    listed["mergeable"] != "MERGEABLE"
+        || listed.pointer("/reviews/pageInfo/hasPreviousPage") != Some(&Value::Bool(false))
+        || nodes(listed, "/reviews/nodes")
+            .iter()
+            .any(|r| r["state"] == "CHANGES_REQUESTED")
+}
+
+/// A comment [`PULL_QUERY`] read, as the REST list has it.
+fn rest_comment(node: &Value) -> Result<Value> {
+    let id: u64 = text(node, "/fullDatabaseId")
+        .parse()
+        .context("a pull request comment has no id")?;
+    Ok(json!({
+        "id": id,
+        "user": {"login": author_login(&node["author"])},
+        "body": node["body"],
+        "created_at": node["createdAt"],
+        "updated_at": node["updatedAt"],
+    }))
+}
+
 /// What, if anything, `decision` for `pull` leaves waiting on the operator.
 /// What the pass resolves by itself is not: a run, check, review or rerun
 /// it waits for, a queue, or an answer it already acts on.
@@ -5604,6 +5646,109 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         )))
     }
 
+    /// One pull request as [`PULL_QUERY`] reads it. Its author is named as
+    /// the REST list and `mergeAuthors` name it, so a listed app such as
+    /// `dependabot[bot]` is still followed here; read raw, GraphQL's
+    /// `dependabot` was never one of them. Only a Bot gets the suffix, which
+    /// GitHub's user logins cannot carry, so a user cannot pass as a listed
+    /// app, nor an app as the bot.
+    fn read_pull(&mut self, owner: &str, name: &str, number: u64) -> Result<Value> {
+        self.spend()?;
+        let data = self.graphql.graphql(
+            PULL_QUERY,
+            json!({"owner": owner, "name": name, "number": number}),
+        )?;
+        let mut pull = data
+            .pointer("/repository/pullRequest")
+            .filter(|p| p.is_object())
+            .context("pull request not found")?
+            .clone();
+        if pull["author"].is_object() {
+            pull["author"]["login"] = author_login(&pull["author"]).into();
+        }
+        Ok(pull)
+    }
+
+    /// `pull`'s comments, as the REST list has them: those [`PULL_QUERY`]
+    /// read where that is all of them, which saves a request for nearly every
+    /// pull request; else the list, without the cache where a pass applies.
+    fn pull_comments(&mut self, repo: &str, number: u64, pull: &Value) -> Result<Vec<Value>> {
+        if pull.pointer("/comments/pageInfo/hasPreviousPage") == Some(&Value::Bool(false)) {
+            return nodes(pull, "/comments/nodes")
+                .iter()
+                .map(rest_comment)
+                .collect();
+        }
+        self.paged(
+            &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+            self.apply.is_some(),
+        )
+    }
+
+    /// The pull requests of `open`, by number, labelled [`LABEL`] that the
+    /// pass would only skip, which one list query says: `decide` skips a
+    /// labelled pull request whatever it reads, and only [`stale`] or
+    /// `operatorAnswers` acts on one. A stale stop needs a conflict or a
+    /// change request, so one with either is read whole. A query that fails,
+    /// or a pull request past its page, is read whole too.
+    fn left_labelled(&mut self, repo: &str, open: &[Value]) -> BTreeMap<u64, Value> {
+        let listed = open.iter().any(|p| {
+            p["labels"]
+                .as_array()
+                .is_some_and(|labels| labels.iter().any(|l| l["name"] == LABEL))
+        });
+        if !listed || self.config.policy.operator_answers {
+            return BTreeMap::new();
+        }
+        let Some((owner, name)) = repo.split_once('/') else {
+            return BTreeMap::new();
+        };
+        if self.spend().is_err() {
+            return BTreeMap::new();
+        }
+        let variables =
+            json!({"owner": owner, "name": name, "label": LABEL, "pulls": LABELLED_READS});
+        let Ok(data) = self.graphql.graphql(LABELLED_QUERY, variables) else {
+            return BTreeMap::new();
+        };
+        let stale_days = self.config.policy.stale_days;
+        nodes(&data, "/repository/pullRequests/nodes")
+            .iter()
+            .filter(|p| stale_days == 0 || !may_be_stale(p))
+            .filter_map(|p| Some((p["number"].as_u64()?, p.clone())))
+            .collect()
+    }
+
+    /// What [`Pass::pull`] comes to for a pull request of [`Pass::left_labelled`].
+    fn labelled_skip(
+        &self,
+        repo: &str,
+        number: u64,
+        merge_only: bool,
+        listed: &Value,
+    ) -> (String, bool, Option<Wait>, Option<Stepped>) {
+        let head = text(listed, "/headRefOid");
+        let reason = format!("labelled {LABEL}");
+        let wait = Wait {
+            repository: repo.to_owned(),
+            number,
+            head: head.to_owned(),
+            kind: "needs-human",
+            reason: reason.clone(),
+        };
+        let stepped = (!merge_only).then(|| Stepped {
+            repository: repo.to_owned(),
+            number,
+            head: head.to_owned(),
+            action: "skip",
+            reason: reason.clone(),
+            ran: self.apply.is_none(),
+            moved_at: moved_at(listed),
+        });
+        let line = format!("{repo}#{number} {} skip: {reason}", short(head));
+        (line, false, Some(wait), stepped)
+    }
+
     /// One pull request's decision line, and whether it is in flight.
     fn pull(
         &mut self,
@@ -5615,36 +5760,25 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let (owner, name) = repo.split_once('/').context("repository")?;
         // The marker decides what is written, so a pass that applies reads it
         // whole and as it is, not from cached pages a 304 may leave standing.
-        // It is read before the label: needs-human labels before it adds its
-        // stop, so a stop read here was labelled before the query below, and
-        // no label there means a person took it off, not that another pass
-        // is between its two writes.
+        // A stop must be read before the label: needs-human labels before it
+        // adds its stop, so a stop read first was labelled before the query
+        // after it, and no label there means a person took it off, not that
+        // another pass is between its two writes. The comments come with the
+        // labels here, or after them, so a new stop with no label reads them
+        // again; an older one's label would have shown ([`STOP_WRITES_SECONDS`]).
+        let mut pull = self.read_pull(owner, name, number)?;
         let mut comments = if merge_only {
             Vec::new()
         } else {
-            self.paged(
-                &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
-                self.apply.is_some(),
-            )?
+            self.pull_comments(repo, number, &pull)?
         };
         let mut marker = find_marker(&comments, &self.config.bot);
-        self.spend()?;
-        let data = self.graphql.graphql(
-            PULL_QUERY,
-            json!({"owner": owner, "name": name, "number": number}),
-        )?;
-        let mut pull = data
-            .pointer("/repository/pullRequest")
-            .filter(|p| p.is_object())
-            .context("pull request not found")?
-            .clone();
-        // From here on the author is named as the REST list and `mergeAuthors`
-        // name it, so a listed app such as `dependabot[bot]` is still followed
-        // here; read raw, GraphQL's `dependabot` was never one of them. Only a
-        // Bot gets the suffix, which GitHub's user logins cannot carry, so a
-        // user cannot pass as a listed app, nor an app as the bot.
-        if pull["author"].is_object() {
-            pull["author"]["login"] = author_login(&pull["author"]).into();
+        if marker.stopped
+            && !labelled(&pull)
+            && stale::stopped_at(&marker, &comments)
+                .is_none_or(|at| self.now - at < time::Duration::seconds(STOP_WRITES_SECONDS))
+        {
+            pull = self.read_pull(owner, name, number)?;
         }
         // The open list was read at the start of the repository's walk, which
         // can be minutes ago: a pull request merged or closed since then gets
@@ -6182,9 +6316,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 .get_or_insert(format!("the review job's runs in {repo} could not be read"));
         }
         let mut required = BTreeMap::new();
+        let left = self.left_labelled(repo, &open);
         for (number, merge_only) in numbers {
             self.deferring = None;
-            match self.pull(repo, number, merge_only, &mut required) {
+            let read = match left.get(&number) {
+                Some(listed) => Ok(self.labelled_skip(repo, number, merge_only, listed)),
+                None => self.pull(repo, number, merge_only, &mut required),
+            };
+            match read {
                 Ok((line, flying, wait, stepped)) => {
                     if let Some(mut review) = self.deferring.take() {
                         let step = stepped.as_ref().map(|_| outcome.steps.len());
