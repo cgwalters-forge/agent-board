@@ -11,6 +11,11 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Optional native Forgejo revisits after normal stage 4 work, using bounded
+  issue/comment reads, shared seeded sampling and the existing claim, lease,
+  start and recovery path. Off by default, with no caller activation;
+  PR follow-up remains refused (docs/forges.md#native-revisits).
+
 - The weekly sweep on a Forgejo board, behind the existing `sweep` setting
   (off unless set). The bot's earliest unedited list comment, not the
   issue body, records what the sweep lists. Its run starts through stage 4's
