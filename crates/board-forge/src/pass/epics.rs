@@ -473,10 +473,12 @@ pub(super) enum Next {
     Hold(Hold),
     /// Due because its sub-issues changed, and why, but held by the wait
     /// after its last planning request: planned early by an idle pass
-    /// ([`Scheduler::replan_idle`]).
+    /// ([`Scheduler::replan_idle`]) where `early`, not where its last plan
+    /// had nothing to do.
     Wait {
         why: String,
         hold: Hold,
+        early: bool,
     },
     /// Its newest accepted plan has no receipt: apply it. `direction`: the
     /// operator commented since, which plans it again if it cannot apply.
@@ -597,6 +599,9 @@ fn reported(comments: &[Comment], bot: &str, at: OffsetDateTime) -> Option<Strin
 
 /// Said of an epic asked about that has no board Why to ask in.
 const OFF_BOARD: &str = "it is not on the board, so it has no Why";
+
+/// Said of a wait an idle pass does not cut short.
+const NOT_EARLY: &str = "; not early, as its last plan had nothing to do";
 
 /// What an epic needs now, from its comments and sub-issues alone, by the
 /// rules of docs/pass.md#what-is-built.
@@ -765,13 +770,18 @@ pub(super) fn decide(i: &Inputs) -> Next {
     let wait = backoff(DAY_SECONDS, empty, cap);
     let until = last + time::Duration::seconds(wait);
     if i.now < until {
+        // Slots sitting empty are worth a plan that may do something, not
+        // another that follows one which did nothing: this change waits out
+        // the backoff that doubled, and a plan that acts ends that.
+        let early = empty == 0;
+        let not_early = if early { "" } else { NOT_EARLY };
         let held = format!(
-            "{why}; planned again from {}, {} hours after its last request",
+            "{why}; planned again from {}, {} hours after its last request{not_early}",
             stamp(until),
             wait / 3600
         );
         let hold = Hold::new(HoldKind::TriageCooldown, held);
-        return Next::Wait { why, hold };
+        return Next::Wait { why, hold, early };
     }
     Next::Plan(why)
 }
@@ -1342,10 +1352,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         match next {
             Next::Idle(why) | Next::Said(why) => self.line(format!("epic {name}: {why}")),
             Next::Hold(hold) => self.epic_held(facts, hold),
-            Next::Wait { why, hold } => {
+            Next::Wait { why, hold, early } => {
                 let at = self.report.holds.len();
                 self.epic_held(facts, hold);
-                if self.waited.is_none() && busy.is_none() && !turn.planned {
+                if early && self.waited.is_none() && busy.is_none() && !turn.planned {
                     self.waited = Some(Waited {
                         at,
                         facts: facts.clone(),

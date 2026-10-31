@@ -561,7 +561,8 @@ unchanged epic is not planned again (agent-board#383). The wait saves runs
 while slots are taken, not while they sit empty: where stage 4 would end
 `idle: N slot(s) free and nothing started` and stage 3 planned no epic, the
 highest-Priority live epic held only by that wait (`hold epic …: its
-sub-issues changed (…); planned again from T, …`) is planned at once, if
+sub-issues changed (…); planned again from T, …`) is planned at once, unless
+[its last plan had nothing to do](#epic-planning-and-recovery), if
 `planPools` and the budget allow a run now, as `start planning OWNER/REPO#N
 pool=P: its sub-issues changed (…); early, with N slot(s) free and nothing
 started`, and its hold is taken back. Still one epic a pass: the rest keep
@@ -2047,7 +2048,10 @@ Body, label and Priority changes in its children are
 churn, not demand (agent-board#429). Coalesce automatic changes for a day
 after a request, doubled for each applied plan in a row with no actions,
 up to `triageFollowUpDays`; new operator direction may bypass that
-interval. An epic whose children are all closed is closed or asked about
+interval. An idle pass may cut that wait short (agent-board#499), but not after
+a plan with no actions: a change since waits out the doubled interval
+(`…; not early, as its last plan had nothing to do`) and then plans it, and a
+plan with actions lets the next change go early again. An epic whose children are all closed is closed or asked about
 once instead of planned. Ignore
 the controller's own comments/timestamps as change triggers. Do not repeatedly
 plan an unchanged empty epic. A planning run in flight holds that epic. A plan
