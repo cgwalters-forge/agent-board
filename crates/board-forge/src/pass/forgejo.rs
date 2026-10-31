@@ -1673,6 +1673,10 @@ mod tests {
         set(&mut epics, "epics.repository", json!("example/plans"));
         set(&mut epics, "epics.close", json!(true));
         assert!(Config::parse(&epics.to_string()).is_ok());
+        let mut focus = epics.clone();
+        set(&mut focus, "epics.focus", json!("example/plans#1"));
+        let refused = Config::parse(&focus.to_string()).unwrap_err();
+        assert!(format!("{refused:#}").contains("unsupported_capability: epics.focus"));
         for (option, follow_up) in [
             ("holds.issue", "#513"),
             ("usage.repository", "#513"),

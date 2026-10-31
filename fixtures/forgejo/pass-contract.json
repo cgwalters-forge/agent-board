@@ -177,6 +177,7 @@
     "board.priorityField": {"verdict": "refused", "reason": "Priority is the priority/ label scope"},
     "epics.repository": {"verdict": "native", "forgejo": "relationship comments, not sub-issues"},
     "epics.inWorkRepositories": {"verdict": "native", "forgejo": "the same epic rule in each work repository"},
+    "epics.focus": {"verdict": "refused", "reason": "the Forgejo stages do not read it yet, and an ignored focus would spend as if it were unset"},
     "epics.maxAppliesPerPass": {"verdict": "same"},
     "epics.close": {"verdict": "native", "forgejo": "PATCH state closed with a comment; no close reason"},
     "wip": {"verdict": "native", "forgejo": "complete caller run listings"},

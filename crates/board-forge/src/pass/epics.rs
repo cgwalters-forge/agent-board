@@ -58,10 +58,10 @@ const STALE_INTRO: &str = "The board pass asks a triage run to plan this epic ag
 
 /// How a planning request's plan comment starts: the first, a retry of the
 /// request named, or one asked for because the epic's plan went stale.
-#[derive(Clone, Copy)]
-enum Intro<'a> {
+#[derive(Clone)]
+enum Intro {
     First,
-    Retry(&'a str),
+    Retry(String),
     Stale,
 }
 /// What the bot asks the operator of an epic whose sub-issues are all closed.
@@ -809,14 +809,33 @@ pub(super) struct Turn {
 /// Stage 3's board, the runs in flight, if they were read, and its target.
 type Later = (Option<Project>, Option<(BTreeSet<u64>, Slots)>, Target);
 
-/// The highest-Priority live epic stage 3 held only by the wait to plan it
-/// again ([`Next::Wait`]), and what planning it takes, for stage 4 to plan
-/// when it would leave slots free and start nothing.
+/// Stage 4's account of `epics.focus` ([`Epics::focus`]).
+#[derive(Default)]
+pub(super) struct Focus {
+    /// The focus epic, once stage 3 has found it live.
+    pub(super) live: Option<ItemRef>,
+    /// Its children among the candidates, which stage 4 takes first.
+    pub(super) children: usize,
+    /// Candidates stage 4 has reached.
+    pub(super) reached: usize,
+    /// Children that could start: those that did, and those held only for
+    /// a pool (its pool has no room, so it cannot use a slot now).
+    pub(super) ready: usize,
+    pub(super) started: usize,
+    /// Whether the rest may start, once stage 4 has taken the children.
+    pub(super) spillover: Option<bool>,
+}
+
+/// The highest-Priority live epic stage 3 did not plan, only for the wait to
+/// plan it again ([`Next::Wait`]) or for the focus epic going first, and what
+/// planning it takes, for stage 4 to plan when it would leave slots free and
+/// start nothing.
 pub(super) struct Waited {
     /// Its hold's index in the report's holds.
     at: usize,
     facts: EpicFacts,
     why: String,
+    intro: Intro,
     reuse: Option<Comment>,
     /// Stage 3's board, runs in flight and target, once it finished.
     later: Option<Later>,
@@ -861,6 +880,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if waited.turn.planned || !self.epic_starts.is_empty() {
             return 0;
         }
+        // Another epic's planning is spillover too.
+        if !self.may_spill(&waited.facts.issue) {
+            return 0;
+        }
         let config = self.config;
         let snapshot = self.snapshot();
         let pool = choose(
@@ -881,13 +904,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.report.holds.remove(waited.at);
         *holds -= 1;
         let why = format!(
-            "{}; early, with {free} slot(s) free and nothing started",
+            "{}, with {free} slot(s) free and nothing started",
             waited.why
         );
-        let ask = (why.as_str(), Intro::First, waited.reuse.as_ref());
+        let ask = (why.as_str(), waited.intro.clone(), waited.reuse.as_ref());
         let before = waited.turn.starts;
         let turn = &mut waited.turn;
-        self.plan_epic(
+        self.plan_now(
             &waited.facts,
             ask,
             project.as_ref(),
@@ -896,6 +919,56 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             turn,
         );
         waited.turn.starts - before
+    }
+
+    /// Whether stage 4 may start something for `issue`'s epic beside the
+    /// focus: always without a focus, for the focus epic, and otherwise as
+    /// its candidates left it.
+    fn may_spill(&self, issue: &ItemRef) -> bool {
+        match &self.focus.live {
+            None => true,
+            Some(focus) => key(focus) == key(issue) || self.focus.spillover == Some(true),
+        }
+    }
+
+    /// Why `epics.focus` is refused, where it is not one of the `live` epics
+    /// stage 3 listed of `repository`. The listing has every open epic of
+    /// that repository; the focus elsewhere, with `epics.inWorkRepositories`,
+    /// takes one read.
+    fn focus_refused(
+        &mut self,
+        focus: &ItemRef,
+        repository: &str,
+        live: &[EpicFacts],
+    ) -> Option<String> {
+        if live.iter().any(|e| key(&e.issue) == key(focus)) {
+            return None;
+        }
+        let name = focus.display();
+        let not_live = || {
+            Some(format!(
+                "{name} is not a live epic (open and labelled epic by the operator or the bot)"
+            ))
+        };
+        if focus.repository.eq_ignore_ascii_case(repository) {
+            return not_live();
+        }
+        let read = (self.issue(ISSUE_QUERY, focus)).and_then(|node| Facts::from_node(&node));
+        let facts = match read {
+            Ok(facts) => facts,
+            Err(error) => return Some(format!("{name} could not be read: {error:#}")),
+        };
+        let parent = Parent {
+            issue: focus.clone(),
+            open: facts.open,
+            labels: facts.labels,
+            labels_complete: facts.labels_complete,
+        };
+        match self.live(&parent) {
+            Ok(true) => None,
+            Ok(false) => not_live(),
+            Err(why) => Some(why),
+        }
     }
 
     fn epics_within(
@@ -938,6 +1011,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             "epics: {} live of {open} open in {repository}",
             live.len()
         ));
+        if let Some(focus) = self.config.focus() {
+            if let Some(why) = self.focus_refused(&focus, repository, &live) {
+                self.holds_whole = false;
+                self.report.failures += 1;
+                self.line(format!(
+                    "focus error: epics.focus: {why}; no epic is planned or applied and no new run starts until pass.json names a live epic or drops the setting"
+                ));
+                return Ok(());
+            }
+            self.focus.live = Some(focus);
+        }
         if live.is_empty() {
             return Ok(());
         }
@@ -952,7 +1036,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             p.and_then(|p| options.iter().position(|o| o == p))
                 .unwrap_or(options.len())
         };
-        live.sort_by_key(|e| (index(e.priority.as_deref()), e.issue.number));
+        let focus = self.focus.live.as_ref().map(key);
+        live.sort_by_key(|e| {
+            (
+                focus.as_ref() != Some(&key(&e.issue)),
+                index(e.priority.as_deref()),
+                e.issue.number,
+            )
+        });
         let target = self.config.target(git_ref);
         let listed = self.runs(&target);
         let slots = match listed.and_then(|listed| Ok((listed, self.leased()?))) {
@@ -1257,7 +1348,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     self.waited = Some(Waited {
                         at,
                         facts: facts.clone(),
-                        why,
+                        why: format!("{why}; early"),
+                        intro: Intro::First,
                         reuse: reuse.cloned(),
                         later: None,
                         turn: Turn::default(),
@@ -1426,7 +1518,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     return;
                 }
                 let why = format!("{none}, retried once");
-                let ask = (why.as_str(), Intro::Retry(record.as_str()), reuse);
+                let ask = (why.as_str(), Intro::Retry(record.clone()), reuse);
                 self.plan_epic(facts, ask, project, slots, target, turn);
             }
             Next::Plan(why) => self.plan_epic(
@@ -1931,6 +2023,41 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// plan protocol, whose record is the planning request. `retry`: the
     /// request that got no plan, which the plan's comment names.
     fn plan_epic(
+        &mut self,
+        facts: &EpicFacts,
+        ask: (&str, Intro, Option<&Comment>),
+        project: Option<&Project>,
+        slots: Option<&(BTreeSet<u64>, Slots)>,
+        target: &Target,
+        turn: &mut Turn,
+    ) {
+        // Before stage 4 nothing says whether the focus epic has work ready:
+        // another epic's planning, a run, waits for that.
+        if let Some(focus) = self.focus.live.clone()
+            && key(&focus) != key(&facts.issue)
+            && !turn.planned
+        {
+            let (why, intro, reuse) = ask;
+            let at = self.report.holds.len();
+            let held = format!("due ({why}); the focus epic {} goes first", focus.display());
+            self.epic_held(facts, Hold::new(HoldKind::Focus, held));
+            if self.waited.is_none() {
+                self.waited = Some(Waited {
+                    at,
+                    facts: facts.clone(),
+                    why: why.to_owned(),
+                    intro,
+                    reuse: reuse.cloned(),
+                    later: None,
+                    turn: Turn::default(),
+                });
+            }
+            return;
+        }
+        self.plan_now(facts, ask, project, slots, target, turn);
+    }
+
+    fn plan_now(
         &mut self,
         facts: &EpicFacts,
         (why, intro, reuse): (&str, Intro, Option<&Comment>),

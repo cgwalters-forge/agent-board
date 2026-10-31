@@ -563,6 +563,17 @@ fn replay_epic_scenarios() {
             Some((HoldKind::Other, false)),
         ),
         (
+            "with epics.focus tracker#890, its plan goes first and the next waits",
+            Box::new(|r| {
+                stale_596(r, json!({"type": "set_priority", "value": "P1"}));
+                unapplied(r);
+            }),
+            "hold epic cgwalters-forge/tracker#596: plan 7000000003@2026-10-23T20:59:10.085106014Z waits; one epic plan is applied a pass",
+            // Its children come first in stage 4, and the recording did not read them.
+            1,
+            Some((HoldKind::Other, false)),
+        ),
+        (
             "with epics.maxAppliesPerPass 2, both apply in one pass (agent-board#455)",
             Box::new(|r| {
                 stale_596(r, json!({"type": "set_priority", "value": "P1"}));
@@ -752,6 +763,8 @@ fn replay_epic_scenarios() {
             json!({"wip": 0})
         } else if name.contains("maxAppliesPerPass") {
             json!({"epics": {"repository": "cgwalters-forge/tracker", "maxAppliesPerPass": 2}})
+        } else if name.contains("epics.focus") {
+            json!({"epics": {"repository": "cgwalters-forge/tracker", "focus": "cgwalters-forge/tracker#890"}})
         } else if name.contains("epics.close") {
             json!({"epics": {"repository": "cgwalters-forge/tracker", "close": true}})
         } else {
@@ -1420,6 +1433,65 @@ fn apply_creates_once_with_final_priorities() {
         ))),
         "{:#?}",
         report.lines
+    );
+}
+
+/// A retry that waits behind `epics.focus` is still asked as a retry, which
+/// is what bounds it: its plan comment names the request it retries.
+#[test]
+fn retry_behind_the_focus_keeps_its_intro() {
+    let mut replay = replay();
+    crate::pass::tests::only(&mut replay, &["cgwalters-forge/tracker#446"]);
+    unfinished(&mut replay);
+    requested(&mut replay, 8 * 60);
+    run_77(&mut replay, Some(7 * 60));
+    // A start's read of the epic again, which the recording never made.
+    let mut read = (replay.requests.iter())
+        .filter_map(|e| e["answer"].pointer("/data/repositoryOwner/projectV2/items/nodes"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .find(|n| n["content"]["number"] == 446)
+        .unwrap()["content"]
+        .clone();
+    read["number"] = 596.into();
+    read["projectItems"] = json!({"nodes": [], "totalCount": 0});
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 596});
+    replay.requests.push(json!({
+        "request": graphql_key(&format!("{FRESH_QUERY}{FACTS}"), &variables),
+        "answer": {"data": {"repository": {"issue": read}}},
+    }));
+    let forge = Forge::new(replay);
+    // tracker#766 is held by a person, so it plans nothing itself.
+    let settings = json!({"triage": false, "epics": {"repository": "cgwalters-forge/tracker",
+        "focus": "cgwalters-forge/tracker#766"}});
+    let config = config(settings);
+    let limits = Limits {
+        writes: Some(10),
+        ..Limits::default()
+    };
+    let report = block(run(
+        &forge,
+        &forge,
+        &config,
+        State::default(),
+        (Mode::Local, limits),
+        forge.replay.now,
+    ))
+    .unwrap();
+    assert!(
+        (report.lines.iter()).any(|l| l
+            .starts_with("hold epic cgwalters-forge/tracker#596: due (")
+            && l.ends_with("goes first")),
+        "{:#?}",
+        report.lines
+    );
+    let writes = forge.writes.borrow();
+    let posted = (writes.iter())
+        .find(|(what, _)| what.ends_with("/596/comments"))
+        .unwrap_or_else(|| panic!("{:#?} {writes:#?}", report.lines));
+    assert!(
+        text(&posted.1, "/body").starts_with(RETRY_INTRO),
+        "{posted:#?}"
     );
 }
 

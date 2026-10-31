@@ -175,7 +175,8 @@ on the operator's approval; the pass reads the issue's labels, not the pull
 request's, nor whether the review job has approved yet),
 `in-flight`, `dispatched` (its plan's run has ended, or an
 epic's planning request waits for its plan), `triage-cooldown` (triaged or
-planned too recently to ask again), `outside-epics` (no triage under the
+planned too recently to ask again), `focus` (an epic due to be planned, behind
+`epics.focus`, see [Scheduling](#scheduling)), `outside-epics` (no triage under the
 triage scope `epics`, see [Scheduling](#scheduling)), `overlap`, `overlap-ignored` (not a hold:
 an overlap the `overlap` setting let start, see [Scheduling](#scheduling)),
 `blocking` (not a hold of an item but a card on the open pull request that
@@ -461,7 +462,7 @@ is refused: the grant replaces them.
 Stage 3 reads the open `epic` issues of `epics.repository` (10 a request),
 then each one's sub-issues with their board Priority (50 a request), the
 board's Priority options, and each live epic's comments, and takes the live
-epics in Priority order. Its first line counts them, such as
+epics in Priority order, an [`epics.focus`](#scheduling) epic first. Its first line counts them, such as
 `epics: 7 live of 17 open in example/tracker`, then one line an epic:
 
 * `apply epic OWNER/REPO#N plan=ID: Create a sub-issue in example/work (P0);
@@ -986,6 +987,53 @@ it (`earlier triage verdict …; nothing changed since`) until
 `triageFollowUpDays` after the verdict, as a follow-up holds an issue whose
 plan carries no fingerprint, or until someone comments or edits a comment, the body or the title;
 then the first triage starts.
+
+With `epics.focus` set to `OWNER/REPO#N`, one epic comes first; unset, every
+live epic ranks as above. Exactly one epic is the default only as far as a
+caller's `pass.json` sets it: agent-board has no way to guess which matters, so
+leaving it unset keeps today's order. The focus epic's plan is applied and its
+planning asked for ahead of every other epic's, and in stage 4 its children
+(its direct sub-issues, in any work repository) are considered ahead of every
+other candidate, each keeping its rank among its own. Everything else is
+spillover. A candidate beyond the children is considered only with a slot still
+free once they have been; another epic's planning, which is a run too, waits as
+a hold of kind `focus` (`due (WHY); the focus epic OWNER/REPO#N goes first`, not
+the operator's and no stall) and starts at the end of stage 4 only on the terms
+of the early re-plan below: no start this pass, a slot free, one a pass, with the
+epic's retry or stale intro kept. An accepted plan of another epic still applies
+after the focus epic's, within `epics.maxAppliesPerPass`, since that starts no
+run. A [revisit](#revisits) goes only to the focus epic's children, since nothing
+asked for it. The [weekly sweep](#the-weekly-sweep)'s run is spillover.
+
+A child held only for a pool, its plan's named pool having no room, is ready but
+cannot use a slot now, and the same pool holds any other plan naming it; so
+spillover starts on the pools that do have room, and held focus work never idles
+the board. WIP is the pass's one slot count; there is no per-pool slot. A child
+that could not be read is held or failed as any candidate is, and does not count
+as ready: it may stay unreadable, and that must not idle the board. Stage 2 is
+not touched: pull requests already open keep their fix and review rounds and
+merge, since finishing open work is the point. The maintain digest, planned
+before either stage, is not held back either.
+
+Each pass with a focus logs one line, for example `focus:
+cgwalters-forge/tracker#786: 3 ready, 2 started, 40 held; spillover allowed:
+no`: children judged able to start (started, failed to start, held by
+`--max-dispatch` or only for a pool), those started, and candidates this pass did
+not reach, children or not, with no slot left. Where stage 4 reached no candidate,
+it says so after `no`. It costs no request for a focus in `epics.repository`,
+whose listing stage 3 reads anyway. One in another work repository, which needs
+`epics.inWorkRepositories`, takes a read of its labels and state, and the read of
+its label's author that its children need anyway; stage 3 plans only
+`epics.repository`'s epics, so only such a focus's children go first. A focus that is not a live epic (closed, unlabelled, labelled by
+someone else, or unreadable) is refused, not ignored: `focus error: epics.focus:
+…`, a failed pass, and stages 3 and 4 plan, apply and start nothing until
+`pass.json` names a live epic or drops the setting, while stage 2 and the later
+stages go on. So a finished focus epic, once closed, by a person or by the pass with
+`epics.close`, stops new work until the setting moves: on purpose, since falling
+back would be silently ignoring it.
+`--replay` shows all of this: a config naming a live epic of the recording. The
+setting is refused at parse on a malformed value, on a repository that could
+never hold a live epic, and on a Forgejo board, whose stages do not read it yet.
 
 Work starts from the epics (agent-board#431). Under the triage scope
 `epics`, triage, its follow-ups above, re-planning below, a triage's rerun
@@ -2350,7 +2398,8 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `board.priorityField` | Priority single-select field; `"Priority"` |
 | `epics.repository` | Repository containing live epics; absent disables epic planning |
 | `epics.inWorkRepositories` | Also take operator-labelled epics in every work repository as live, for candidates only; `false` |
-| `epics.maxAppliesPerPass` | The most accepted epic plans a pass applies (1–10), in Priority order; a refused plan does not count, and `--max-writes` still holds what they write; `1` |
+| `epics.focus` | The one live epic, `OWNER/REPO#N`, whose planning, applies and children go first, everything else starting only as spillover; refused where it is not a live epic, and on a Forgejo board, see [scheduling](#scheduling); unset (no focus) |
+| `epics.maxAppliesPerPass` | The most accepted epic plans a pass applies (1–10), the focus epic's first, then in Priority order; a refused plan does not count, and `--max-writes` still holds what they write; `1` |
 | `epics.close` | Close as completed a due epic whose sub-issues are all closed, rather than ask the operator once, see [what is built](#what-is-built); `false` |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |

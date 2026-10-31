@@ -9002,6 +9002,18 @@ fn config_table() {
             "budget needs usage, the snapshot",
         ),
         (
+            json!({"epics": {"repository": "o/tracker", "focus": "tracker"}}),
+            "epics focus \"tracker\" is not OWNER/REPO#N",
+        ),
+        (
+            json!({"epics": {"repository": "o/tracker", "focus": "o/tracker#0"}}),
+            "epics focus \"o/tracker#0\" is not OWNER/REPO#N",
+        ),
+        (
+            json!({"epics": {"repository": "o/tracker", "focus": "o/other#1"}}),
+            "epics focus o/other#1 can never be a live epic",
+        ),
+        (
             json!({"epics": {"repository": "o/tracker", "maxAppliesPerPass": 0}}),
             "epics maxAppliesPerPass is not from 1 to 10",
         ),
@@ -11936,4 +11948,368 @@ fn kept_reads_last_until_the_next_write() {
     // Every read sent, the failed one too, and the write were budgeted;
     // kept answers were not.
     assert_eq!(spent, 9 + 1);
+}
+
+/// The focus epic's settings: `epics.focus` set to `focus` in the fixture's
+/// epics repository.
+fn focused(c: &mut Value, focus: &str) {
+    c["epics"] = json!({"repository": "cgwalters-forge/tracker", "focus": focus});
+}
+
+/// Makes the board's `OWNER/REPO#N` a child of the epic `epic`, there.
+fn child_of(replay: &mut Replay, child: &str, epic: (&str, u64)) {
+    let parent = json!({"number": epic.1, "state": "OPEN", "repository": {"nameWithOwner": epic.0},
+        "labels": {"nodes": [{"name": EPIC_LABEL}], "totalCount": 1}});
+    for entry in &mut replay.requests {
+        let nodes = (entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes"))
+            .and_then(Value::as_array_mut);
+        for node in nodes.into_iter().flatten() {
+            let content = &mut node["content"];
+            let name = format!(
+                "{}#{}",
+                text(content, "/repository/nameWithOwner"),
+                content["number"]
+            );
+            if name == child {
+                content["parent"] = parent.clone();
+            }
+        }
+    }
+}
+
+/// tracker#446 alone on the board, due a revisit, and whether a child of the
+/// focus epic.
+fn revisit_446(replay: &mut Replay, settings: &mut Value, child: bool) {
+    const ISSUE: &str = "cgwalters-forge/tracker#446";
+    only(replay, &[ISSUE]);
+    silent(replay, &[(ISSUE, 60)], &[ISSUE]);
+    if child {
+        child_of(replay, ISSUE, (TRACKER, 890));
+    }
+    focused(settings, FOCUS_890);
+    settings["wip"] = 12.into();
+    settings["revisit"] = json!({"perPass": 1, "afterDays": 14, "heldAfterDays": 3});
+}
+
+const FOCUS_890: &str = "cgwalters-forge/tracker#890";
+const TRACKER: &str = "cgwalters-forge/tracker";
+
+/// `epics.focus`: its children first, and everything else only in what they
+/// leave. Each case gives the starts in order and the lines it must log.
+#[test]
+fn focus_epic_goes_first_and_the_rest_spill_over() {
+    const REST: &[&str] = &[
+        "cgwalters-forge/tracker#446",
+        "cgwalters-forge/tracker#459",
+        "cgwalters-forge/tracker#533",
+        "cgwalters-forge/tracker#540",
+    ];
+    // A pass of four candidates with no plans: triage starts each. The
+    // recording has two runs active, so `wip` less two are free.
+    let four = |r: &mut Replay| only(r, REST);
+    type Edit = Box<dyn Fn(&mut Replay, &mut Value)>;
+    type Case = (
+        &'static str,
+        Edit,
+        Vec<&'static str>,
+        Vec<&'static str>,
+        usize,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "no focus: Priority order, as ever",
+            Box::new(move |r, _| four(r)),
+            vec![
+                "triage cgwalters-forge/tracker#446",
+                "triage cgwalters-forge/tracker#459",
+                "triage cgwalters-forge/tracker#533",
+                "triage cgwalters-forge/tracker#540",
+            ],
+            vec![],
+            0,
+        ),
+        (
+            "slots run out on the children: the rest wait",
+            Box::new(move |r, c| {
+                four(r);
+                child_of(r, "cgwalters-forge/tracker#533", (TRACKER, 890));
+                child_of(r, "cgwalters-forge/tracker#540", (TRACKER, 890));
+                focused(c, FOCUS_890);
+                c["wip"] = 4.into();
+            }),
+            vec![
+                "triage cgwalters-forge/tracker#533",
+                "triage cgwalters-forge/tracker#540",
+            ],
+            vec![
+                "focus: cgwalters-forge/tracker#890: 2 ready, 2 started, 2 held; spillover allowed: no",
+            ],
+            0,
+        ),
+        (
+            "a slot left after the children: the rest take it, in order",
+            Box::new(move |r, c| {
+                four(r);
+                child_of(r, "cgwalters-forge/tracker#540", (TRACKER, 890));
+                focused(c, FOCUS_890);
+                c["wip"] = 4.into();
+            }),
+            vec![
+                "triage cgwalters-forge/tracker#540",
+                "triage cgwalters-forge/tracker#446",
+            ],
+            vec![
+                "focus: cgwalters-forge/tracker#890: 1 ready, 1 started, 2 held; spillover allowed: yes",
+            ],
+            0,
+        ),
+        (
+            "the focus has nothing ready: a person holds its child, the rest start",
+            Box::new(move |r, c| {
+                four(r);
+                child_of(r, "cgwalters-forge/tracker#540", (TRACKER, 890));
+                for entry in &mut r.requests {
+                    let nodes = (entry["answer"]
+                        .pointer_mut("/data/repositoryOwner/projectV2/items/nodes"))
+                    .and_then(Value::as_array_mut);
+                    for node in nodes.into_iter().flatten() {
+                        if node["content"]["number"] == 540 {
+                            let labels = &mut node["content"]["labels"];
+                            let names = labels["nodes"].as_array_mut().unwrap();
+                            names.push(json!({"name": "needs-design"}));
+                            labels["totalCount"] = names.len().into();
+                        }
+                    }
+                }
+                focused(c, FOCUS_890);
+                c["wip"] = 4.into();
+            }),
+            vec![
+                "triage cgwalters-forge/tracker#446",
+                "triage cgwalters-forge/tracker#459",
+            ],
+            vec![
+                "focus: cgwalters-forge/tracker#890: 0 ready, 0 started, 1 held; spillover allowed: yes",
+            ],
+            0,
+        ),
+        (
+            "its ready child's plan names a pool with no room: the others spill over",
+            Box::new(move |r, c| {
+                four(r);
+                child_of(r, "cgwalters-forge/tracker#446", (TRACKER, 890));
+                implement_plan(r);
+                let comments = &mut answer(r, r#""name":"tracker","number":446"#)["data"]["repository"]
+                    ["issue"]["comments"]["nodes"];
+                let plan = comments.as_array_mut().unwrap().last_mut().unwrap();
+                let body = text(plan, "/body").replace(
+                    r#""kind":"implement""#,
+                    r#""kind":"implement","pool":"openai""#,
+                );
+                plan["body"] = body.into();
+                focused(c, FOCUS_890);
+                c["wip"] = 4.into();
+            }),
+            vec![
+                "triage cgwalters-forge/tracker#459",
+                "triage cgwalters-forge/tracker#533",
+            ],
+            vec![
+                "hold cgwalters-forge/tracker#446: no pool: openai is held",
+                "focus: cgwalters-forge/tracker#890: 1 ready, 0 started, 1 held; spillover allowed: yes",
+            ],
+            0,
+        ),
+        (
+            "a child that cannot be read is not ready, so it never idles the board",
+            Box::new(|r, c| {
+                only(
+                    r,
+                    &[
+                        "cgwalters-forge/agent-board#289",
+                        "cgwalters-forge/tracker#446",
+                    ],
+                );
+                focused(c, FOCUS_890);
+            }),
+            vec!["triage cgwalters-forge/tracker#446"],
+            vec![
+                "fail cgwalters-forge/agent-board#289: ",
+                "focus: cgwalters-forge/tracker#890: 0 ready, 0 started, 0 held; spillover allowed: yes",
+            ],
+            1,
+        ),
+        (
+            "more children than slots: those not reached count as held",
+            Box::new(move |r, c| {
+                four(r);
+                child_of(r, "cgwalters-forge/tracker#459", (TRACKER, 890));
+                child_of(r, "cgwalters-forge/tracker#533", (TRACKER, 890));
+                child_of(r, "cgwalters-forge/tracker#540", (TRACKER, 890));
+                focused(c, FOCUS_890);
+                c["wip"] = 3.into();
+            }),
+            vec!["triage cgwalters-forge/tracker#459"],
+            vec![
+                "focus: cgwalters-forge/tracker#890: 1 ready, 1 started, 3 held; spillover allowed: no",
+            ],
+            0,
+        ),
+        (
+            "every slot taken: the line still says so",
+            Box::new(move |r, c| {
+                four(r);
+                focused(c, FOCUS_890);
+                c["wip"] = 2.into();
+            }),
+            vec![],
+            vec![
+                "focus: cgwalters-forge/tracker#890: 0 ready, 0 started, 0 held; spillover allowed: no (no candidate was considered)",
+            ],
+            0,
+        ),
+        (
+            "another epic's planning waits behind the focus, planned or waiting",
+            Box::new(move |r, c| {
+                four(r);
+                unfinished(r);
+                focused(c, FOCUS_890);
+            }),
+            vec![
+                "triage cgwalters-forge/tracker#446",
+                "triage cgwalters-forge/tracker#459",
+                "triage cgwalters-forge/tracker#533",
+                "triage cgwalters-forge/tracker#540",
+            ],
+            vec![
+                "hold epic cgwalters-forge/tracker#890: its sub-issues changed",
+                "hold epic cgwalters-forge/tracker#596: due (",
+            ],
+            0,
+        ),
+        (
+            "an idle pass plans the focus epic ahead of an epic due before it",
+            Box::new(|r, c| {
+                only(r, &["cgwalters-forge/tracker#446"]);
+                unfinished(r);
+                focused(c, FOCUS_890);
+                c["triage"] = false.into();
+            }),
+            vec!["planning cgwalters-forge/tracker#890"],
+            vec!["hold epic cgwalters-forge/tracker#596: due ("],
+            0,
+        ),
+        (
+            "an idle pass with nothing for the focus epic to plan plans another as spillover",
+            Box::new(|r, c| {
+                only(r, &["cgwalters-forge/tracker#446"]);
+                unfinished(r);
+                // Labelled needs-human in the recording: it plans nothing.
+                focused(c, "cgwalters-forge/tracker#766");
+                c["triage"] = false.into();
+            }),
+            vec!["planning cgwalters-forge/tracker#596"],
+            vec![
+                "focus: cgwalters-forge/tracker#766: 0 ready, 0 started, 0 held; spillover allowed: yes",
+            ],
+            0,
+        ),
+        (
+            "a revisit is only for the focus epic's children: tracker#446 is not one",
+            Box::new(|r, c| revisit_446(r, c, false)),
+            vec!["planning cgwalters-forge/tracker#890"],
+            vec!["revisit: none of 0 candidate(s) is due"],
+            0,
+        ),
+        (
+            "a revisit is only for the focus epic's children: tracker#446 is one",
+            Box::new(|r, c| revisit_446(r, c, true)),
+            vec!["revisit cgwalters-forge/tracker#446"],
+            vec![],
+            0,
+        ),
+        (
+            "a focus that is not an open epic stops stage 3 and stage 4",
+            Box::new(move |r, c| {
+                four(r);
+                unfinished(r);
+                focused(c, "cgwalters-forge/tracker#999");
+            }),
+            vec![],
+            vec![
+                "focus error: epics.focus: cgwalters-forge/tracker#999 is not a live epic (open and labelled epic by the operator or the bot)",
+                "schedule: no new run starts: epics.focus cgwalters-forge/tracker#999 is not confirmed live",
+            ],
+            1,
+        ),
+        (
+            "a focus in a work repository takes one read and keeps its children in scope",
+            Box::new(|r, c| {
+                sub_issue(r, "cgwalters-forge/review", "cgwalters");
+                focus_read(r, "OPEN");
+                c["epics"] = json!({"repository": TRACKER, "inWorkRepositories": true,
+                    "focus": "cgwalters-forge/review#135"});
+            }),
+            vec!["triage cgwalters-forge/tracker#446"],
+            vec![
+                "focus: cgwalters-forge/review#135: 1 ready, 1 started, 0 held; spillover allowed: yes",
+            ],
+            0,
+        ),
+        (
+            "a closed focus in a work repository is refused too",
+            Box::new(|r, c| {
+                sub_issue(r, "cgwalters-forge/review", "cgwalters");
+                focus_read(r, "CLOSED");
+                c["epics"] = json!({"repository": TRACKER, "inWorkRepositories": true,
+                    "focus": "cgwalters-forge/review#135"});
+            }),
+            vec![],
+            vec!["focus error: epics.focus: cgwalters-forge/review#135 is not a live epic"],
+            1,
+        ),
+    ];
+    for (name, edit, starts, lines, failures) in cases {
+        let mut replay = replay();
+        let mut settings = json!({});
+        edit(&mut replay, &mut settings);
+        let report = crate::pool_choice::with_index(0, || preview(&config(settings), &replay));
+        let got: Vec<&str> = (report.lines.iter())
+            .filter_map(|l| l.strip_prefix("start "))
+            .collect();
+        assert_eq!(got.len(), starts.len(), "{name}: {:#?}", report.lines);
+        for (got, start) in got.iter().zip(&starts) {
+            assert!(got.starts_with(start), "{name}: {got} is not {start}");
+        }
+        for line in &lines {
+            assert!(
+                report.lines.iter().any(|l| l.starts_with(line)),
+                "{name}: no line {line:?} in {:#?}",
+                report.lines
+            );
+        }
+        assert_eq!(report.failures, failures, "{name}: {:#?}", report.lines);
+    }
+}
+
+/// The read of a focus outside the epics repository, tracker#446's facts as
+/// [`sub_issue`]'s cgwalters-forge/review#135.
+fn focus_read(replay: &mut Replay, state: &str) {
+    let mut node = (replay.requests.iter())
+        .filter_map(|e| e["answer"].pointer("/data/repositoryOwner/projectV2/items/nodes"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .find(|n| n["content"]["number"] == 446)
+        .unwrap()["content"]
+        .clone();
+    node["number"] = 135.into();
+    node["state"] = state.into();
+    node["repository"] = json!({"nameWithOwner": "cgwalters-forge/review"});
+    node["parent"] = Value::Null;
+    node["labels"] = json!({"nodes": [{"name": EPIC_LABEL}], "totalCount": 1});
+    let variables = json!({"owner": "cgwalters-forge", "name": "review", "number": 135});
+    replay.requests.push(json!({
+        "request": graphql_key(&format!("{ISSUE_QUERY}{FACTS}"), &variables),
+        "answer": {"data": {"repository": {"issue": node}}},
+    }));
 }

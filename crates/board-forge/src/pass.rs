@@ -582,6 +582,11 @@ pub struct Epics {
     /// `repository`'s.
     #[serde(default)]
     pub in_work_repositories: bool,
+    /// Off unless set: the live epic `OWNER/REPO#N` whose planning, applies
+    /// and children go first, everything else starting only as spillover
+    /// (docs/pass.md#scheduling). Not a live epic: stages 3 and 4 refuse it.
+    #[serde(default)]
+    pub focus: Option<String>,
     /// Off unless set: an epic whose sub-issues are all closed is closed as
     /// completed, rather than asked about once ([`Scheduler::finish_epic`]).
     #[serde(default)]
@@ -927,6 +932,15 @@ impl Config {
                 (1..=MAX_APPLIES_LIMIT).contains(&epics.max_applies_per_pass),
                 "epics maxAppliesPerPass is not from 1 to {MAX_APPLIES_LIMIT}"
             );
+            if let Some(focus) = &epics.focus {
+                let at = crate::epic::IssueRef::parse(focus)
+                    .with_context(|| format!("epics focus {focus:?} is not OWNER/REPO#N"))?;
+                ensure!(
+                    self.epic_repository(&at.repo),
+                    "epics focus {focus} can never be a live epic: it is outside epics repository {} and, with inWorkRepositories, the work repositories",
+                    epics.repository
+                );
+            }
         }
         for (name, settings) in &self.pools.0 {
             ensure!(valid_pool(name), "pool {name:?} is not a pool name");
@@ -1202,6 +1216,26 @@ impl Config {
             workflow: self.dispatch_workflow.clone(),
             git_ref: git_ref.into(),
         }
+    }
+
+    /// Whether an epic in `repository` may be live: `epics.repository`, or
+    /// with [`Epics::in_work_repositories`] a work repository.
+    fn epic_repository(&self, repository: &str) -> bool {
+        self.epics.as_ref().is_some_and(|epics| {
+            repository.eq_ignore_ascii_case(&epics.repository)
+                || (epics.in_work_repositories && self.works_in(repository))
+        })
+    }
+
+    /// [`Epics::focus`], as [`Self::check`] parsed it.
+    fn focus(&self) -> Option<ItemRef> {
+        let focus = self.epics.as_ref()?.focus.as_ref()?;
+        let at = crate::epic::IssueRef::parse(focus).ok()?;
+        Some(ItemRef {
+            host: DEFAULT_HOST.into(),
+            repository: at.repo,
+            number: at.number,
+        })
     }
 
     fn works_in(&self, repository: &str) -> bool {
@@ -2447,6 +2481,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         other: None,
         epic_starts: Vec::new(),
         waited: None,
+        focus: epics::Focus::default(),
         considered: false,
         probes: BTreeMap::new(),
         holds_whole: true,
@@ -2507,6 +2542,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         scheduler.report.failures += 1;
         scheduler.line(format!("schedule error: {error:#}"));
     }
+    scheduler.focus_unjudged();
     // Stage 4b: approved fork pull requests promoted upstream, after stage 2,
     // which may move a head, and before Status, which sees its effects.
     scheduler.line(promote::line(config.promote.as_ref()));
@@ -2745,6 +2781,8 @@ struct Scheduler<'a, C> {
     epic_starts: Vec<ItemRef>,
     /// The epic stage 4 plans early where it would be idle.
     waited: Option<epics::Waited>,
+    /// Stage 4's account of `epics.focus`.
+    focus: epics::Focus,
     /// Whether stage 4 has considered a candidate, after which a budget
     /// stop defers the rest ([`Halt::Budget`]).
     considered: bool,
@@ -2992,6 +3030,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.line("schedule: off (wip 0 or no workRepositories)".into());
             return Ok(());
         }
+        // Refused or unknown, which stage 3 said: never read as no focus.
+        if let (Some(focus), None) = (config.focus(), &self.focus.live) {
+            let focus = focus.display();
+            self.line(format!(
+                "schedule: no new run starts: epics.focus {focus} is not confirmed live"
+            ));
+            return Ok(());
+        }
         if self.apply {
             // Only a writer's plans count: another account's triage plan
             // would be passed over, and posted again on every pass.
@@ -3098,14 +3144,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(());
         };
         let holds = self.report.holds.len();
-        let candidates = self.candidates(&board);
+        let mut candidates = self.candidates(&board);
+        self.focus_first(&mut candidates);
         // From here on, until stage 4 is done, a read that would leave too
         // little for a start is not sent ([`START_RESERVE`]), with each
         // lease's own reads where its recheck reads them again.
         let leases = LEASE_RECHECK_REQUESTS * slots.leased.len();
         self.client.bounds.reserve.set(START_RESERVE + leases);
         let (free, started) = self.start(&candidates, &board, &mut slots, free, context);
-        let (free, revisited) = self.revisit(&candidates, &board, &mut slots, free, context);
+        self.focus_judged(candidates.len(), free);
+        // With a focus, only its children are revisited: a revisit is a
+        // triage nothing asked for, so it is never spillover's to spend.
+        let revisits = match self.focus.live {
+            Some(_) => &candidates[..self.focus.children],
+            None => &candidates[..],
+        };
+        let (free, revisited) = self.revisit(revisits, &board, &mut slots, free, context);
         let (free, swept) = self.sweep(&candidates, &board, &mut slots, free, context);
         let mut taken = started + revisited + swept;
         let ranked: Vec<ItemRef> = candidates.iter().map(|(_, f)| f.issue.clone()).collect();
@@ -3127,8 +3181,56 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         Ok(())
     }
 
+    /// Puts the children of the focus epic first, each keeping its rank.
+    fn focus_first(&mut self, candidates: &mut [(Rank, &Facts)]) {
+        let Some(focus) = self.focus.live.as_ref().map(key) else {
+            return;
+        };
+        let outside = |facts: &Facts| {
+            !facts
+                .parent
+                .as_ref()
+                .is_some_and(|p| key(&p.issue) == focus)
+        };
+        candidates.sort_by_key(|(_, facts)| outside(facts));
+        self.focus.children = candidates.iter().filter(|(_, f)| !outside(f)).count();
+    }
+
+    /// After the candidates, stage 4's `focus:` line, and whether spillover
+    /// may start: it did, or every child was taken with a slot left.
+    fn focus_judged(&mut self, candidates: usize, free: usize) {
+        let Some(name) = self.focus.live.as_ref().map(ItemRef::display) else {
+            return;
+        };
+        let focus = &mut self.focus;
+        let spill = focus.spillover == Some(true) || (free > 0 && focus.reached >= focus.children);
+        focus.spillover = Some(spill);
+        let held = candidates - focus.reached;
+        let (ready, started) = (focus.ready, focus.started);
+        let spill_word = if spill { "yes" } else { "no" };
+        self.line(format!(
+            "focus: {name}: {ready} ready, {started} started, {held} held; spillover allowed: {spill_word}"
+        ));
+    }
+
+    /// The `focus:` line of a pass whose stage 4 reached no candidate.
+    fn focus_unjudged(&mut self) {
+        if self.focus.spillover.is_none()
+            && let Some(name) = self.focus.live.as_ref().map(ItemRef::display)
+        {
+            self.line(format!(
+                "focus: {name}: 0 ready, 0 started, 0 held; spillover allowed: no (no candidate was considered)"
+            ));
+        }
+    }
+
     /// Starts the board's candidates in order while `free` slots last: how
-    /// many slots are left free, and how many runs it took.
+    /// many slots are left free, and how many runs it took. Past the focus
+    /// epic's children (first, [`Self::focus_first`]), the rest only spill
+    /// into what they left: no slot left stops them as it does any candidate,
+    /// and a pool the children's plans wait on holds any plan that names it
+    /// too. A child that could not be read is not ready: it may never be
+    /// readable, and held focus work must not idle the board.
     fn start(
         &mut self,
         candidates: &[(Rank, &Facts)],
@@ -3164,6 +3266,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 ));
                 break;
             }
+            let focused = n < self.focus.children;
+            self.focus.reached = n + 1;
+            if !focused {
+                self.focus.spillover = Some(true);
+            }
             let issue = facts.issue.display();
             let step = self.within_reserve(|s| s.consider(facts, board, slots, snapshot, target));
             for why in self.ignored.take() {
@@ -3181,6 +3288,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     continue;
                 }
             };
+            if focused {
+                let focus = &mut self.focus;
+                match &step {
+                    Step::Hold(hold) if hold.kind == HoldKind::Pools => focus.ready += 1,
+                    Step::Hold(_) | Step::Stop(..) => {}
+                    Step::Started(..) => {
+                        focus.ready += 1;
+                        focus.started += 1;
+                    }
+                    Step::Capped(_) | Step::Failed(..) => focus.ready += 1,
+                }
+            }
             let (line, holds, failed) = match step {
                 Step::Hold(hold) => {
                     self.held(facts, hold);
@@ -3648,9 +3767,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// triage access can make an issue's children work. Read once a pass each.
     fn live(&mut self, parent: &Parent) -> std::result::Result<bool, String> {
         let config = self.config;
-        let Some(epics) = &config.epics else {
+        if config.epics.is_none() {
             return Ok(false);
-        };
+        }
         let at = key(&parent.issue);
         if let Some(known) = self.epics.get(&at) {
             return known.clone();
@@ -3659,9 +3778,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .labels
             .iter()
             .any(|l| l.eq_ignore_ascii_case(EPIC_LABEL));
-        let repository = &parent.issue.repository;
-        let covered = repository.eq_ignore_ascii_case(&epics.repository)
-            || (epics.in_work_repositories && config.works_in(repository));
+        let covered = config.epic_repository(&parent.issue.repository);
         let live = if !covered || !parent.open {
             Ok(false)
         } else if !parent.labels_complete {
