@@ -549,9 +549,17 @@ appended, never edited:
   posted by the bot's id whose body starts with
   `<!-- agent-board-sweep v1 -->`. The pass looks first among the open
   issues (`created_by` the bot), then among all issues updated since this
-  week's due time, each listing read whole (4 pages of 50, `X-Total-Count`).
-  A listing that is cut short or fails is a `sweep error:`, and then no
-  sweep is filed or started. Stage 4 leaves the issue out of its candidates.
+  week's due time. Each listing is read whole, every page of 50 matching one
+  `X-Total-Count`, so an open sweep filed weeks ago is found behind any
+  number of newer bot issues. The two listings together may read at most
+  half of the requests the pass has left when the first begins, and they
+  stop at the pass's time bound. Every pass with `sweep` set reads the open
+  listing whole, so its cost grows with the open bot issues there, a page
+  for each 50. A listing that is cut short, fails, or whose first
+  page counts more pages than that is a `sweep error:`, and then no sweep is
+  filed or started. With the pass's 500 requests, that is room for about
+  10,000 open bot issues in `sweep.repository`, fewer where earlier stages
+  spent more; past that the sweep errs on every pass until there are fewer. Stage 4 leaves the issue out of its candidates.
 * **The list.** The pass files the issue with `create_issue` (no labels,
   never sent again) and then appends the list record:
   `<!-- agent-board-sweep-list: N -->`, where `N` is the issue's own number,
@@ -559,7 +567,9 @@ appended, never edited:
   "due": T, "issues": […]}`). Only the bot's earliest such comment counts. It
   comes before the run's dispatch, so a run posting as the bot cannot replace
   it. The issue's server-set `created_at` decides whether this week's sweep
-  was filed, so at most one is filed in each week. The list's `due` is
+  was filed, so at most one is filed in each week. The pass files only with
+  the requests left for both writes, so an issue is not left without its
+  record for want of them. The list's `due` is
   informational; the server-set creation time decides the week. If the create's reply is
   lost, or the pass stops before the record, the next pass finds an open
   sweep with no list. That sweep is stuck: nothing is filed again, and
@@ -572,9 +582,14 @@ appended, never edited:
   recovered and never started again. An unclaimed plan is reused only if it
   is the issue's only plan fence, posted by the bot with the sweep intro and
   the exact sweep brief, a triage kind, hosted runner and a `triagePools`
-  pool, with no dispatch claim or receipt anywhere on the issue. Otherwise
-  a person dispatches it. Reuse checks slots and pools again, without
-  another plan; a run cannot post a plan to start another run itself.
+  pool, with no recorder's dispatch claim or receipt on the issue. Otherwise
+  a person dispatches it. Only recorders' comments count here, as they do
+  for claims and plans: a marker or plan fence from anyone else neither
+  blocks a start nor proves one. Reuse checks slots and pools again, without
+  another plan; a run cannot post a plan to start another run itself. A
+  claim and receipt the bot deleted leave no trace on Forgejo, so a run that
+  deleted its own would be started again, within the same slots, pools,
+  budget hold and `--max-dispatch`.
 * **The reply.** Once the run is no longer in flight, the reply is the
   bot's newest comment after the dispatch claim that holds the
   `agent-board-sweep-verdicts` block.
@@ -594,11 +609,19 @@ appended, never edited:
   is.
   A later pass reads the claim's receipt. It then adds the label or close
   where a pass stopped before it, and otherwise waits for the operator.
-  Receipt lines summarise long reasons/questions; the reply keeps the full
-  text. An oversized receipt leaves `attached` empty and adds `attached_count`.
-  A missing or permission-denied issue or epic, or a closed epic, is left
-  for the operator, not attached. Other read failures abort the apply for
-  a later pass to retry, with the cause in its error line. Non-attach
+  Receipt lines summarise long reasons/questions on one line each, with
+  backticks and line breaks replaced, so no text from the reply can open a
+  fence; the reply keeps the full text. An oversized receipt leaves
+  `attached` empty and adds `attached_count`.
+  An issue or epic whose records the shared validation refuses is left for
+  the operator, not attached: missing, permission-denied, a closed epic, an
+  edited recorder comment, a pull request or another issue where the issue
+  was asked for, a comment listed twice, or an epic's children comment that
+  cannot be read. A refused read is made once more first, so a comment
+  posted between the issue's read and its thread's (which the comment count
+  refuses) does not leave the item. Where a request itself failed (the transport, or the
+  pass's request or time budget), the apply stops before its first write,
+  with the cause in its error line, and a later pass retries it. Non-attach
   verdicts need no issue thread read.
 * **Recovery.** A claim with no receipt is an apply that was cut short. The
   pass reads the claimed reply again and checks each attach against both

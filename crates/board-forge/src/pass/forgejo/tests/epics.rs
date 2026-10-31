@@ -190,10 +190,14 @@ impl ForgejoTransport for Instance {
             body: page(url, items).into(),
             total: total.then_some(items.len() as u64),
         };
+        // The comments of the sweep issue example/work#30 were read: its
+        // apply is under way.
+        let applying_sweep =
+            || (self.requests.borrow().iter()).any(|u| u.contains("/issues/30/comments"));
         let body = match segments[..] {
             ["repos", owner, name, "issues"] => {
                 let repo = format!("{owner}/{name}");
-                let listed: Vec<Value> = (self.issues.borrow().iter())
+                let mut listed: Vec<Value> = (self.issues.borrow().iter())
                     .filter(|((r, _), i)| {
                         *r == repo
                             && (query["state"] == "all" || i["state"] == query["state"].as_str())
@@ -210,11 +214,28 @@ impl ForgejoTransport for Instance {
                     })
                     .map(|(_, i)| i.clone())
                     .collect();
-                // One the total says is there, but is not listed.
-                if self.fault.get() == "sweep-listing" && query.contains_key("created_by") {
-                    let mut response = paged(&listed, true);
-                    response.total = Some(listed.len() as u64 + 1);
-                    return Ok(response);
+                // Newest first, as Forgejo lists issues.
+                listed.sort_by(|a, b| {
+                    let key = |i: &Value| {
+                        (
+                            i["created_at"].as_str().map(str::to_owned),
+                            i["id"].as_u64(),
+                        )
+                    };
+                    key(b).cmp(&key(a))
+                });
+                if query.contains_key("created_by") {
+                    let page: usize = query["page"].parse()?;
+                    match self.fault.get() {
+                        // One the total says is there, but is not listed.
+                        "sweep-listing" => {
+                            let mut response = paged(&listed, true);
+                            response.total = Some(listed.len() as u64 + 1);
+                            return Ok(response);
+                        }
+                        "sweep-page-failure" if page > 1 => bail!("temporary listing failure"),
+                        _ => {}
+                    }
                 }
                 return Ok(paged(&listed, true));
             }
@@ -232,12 +253,8 @@ impl ForgejoTransport for Instance {
                     .get(&key)
                     .cloned()
                     .ok_or(crate::forgejo::NotFound)?;
-                let applying_sweep = self
-                    .requests
-                    .borrow()
-                    .iter()
-                    .any(|u| u.contains("/issues/30/comments"));
-                if key == at(PLANS, EPIC) && applying_sweep {
+                let sweeping = applying_sweep();
+                if key == at(PLANS, EPIC) && sweeping {
                     match self.fault.get() {
                         "epic-permission" => {
                             return Err(crate::forgejo::AuthenticationRequired(
@@ -247,14 +264,42 @@ impl ForgejoTransport for Instance {
                         }
                         "epic-transient" => bail!("temporary read failure"),
                         "epic-closed" => issue["state"] = "closed".into(),
+                        "epic-identity" => issue["number"] = 4.into(),
                         _ => {}
                     }
                 }
+                if key == at(WORK, 8) && sweeping && self.fault.get() == "child-identity" {
+                    issue["pull_request"] = json!({"merged": false});
+                }
                 issue["comments"] = self.thread(&key.0, key.1).len().into();
+                // A comment posted after this read and gone from the next:
+                // the count is one more than the thread, once.
+                if key == at(WORK, 8) && sweeping && self.fault.get() == "child-race" {
+                    self.fault.set("");
+                    issue["comments"] = (self.thread(&key.0, key.1).len() + 1).into();
+                }
                 issue
             }
             ["repos", owner, name, "issues", n, "comments"] => {
-                json!(self.thread(&format!("{owner}/{name}"), n.parse()?))
+                let key = at(&format!("{owner}/{name}"), n.parse()?);
+                let mut thread = self.thread(&key.0, key.1);
+                // The epic's newest children comment, after stage 3 read it.
+                let newest = (key == at(PLANS, EPIC) && applying_sweep())
+                    .then(|| {
+                        (thread.iter_mut()).rfind(|c| {
+                            (c["body"].as_str().unwrap())
+                                .starts_with("<!-- agent-board-epic-children:")
+                        })
+                    })
+                    .flatten();
+                match (self.fault.get(), newest) {
+                    ("epic-edited", Some(c)) => c["updated_at"] = "2026-10-23T15:16:00Z".into(),
+                    ("epic-malformed", Some(c)) => {
+                        c["body"] = "<!-- agent-board-epic-children: 3 -->\nnot a list".into();
+                    }
+                    _ => {}
+                }
+                json!(thread)
             }
             ["repos", _, _, "issues", "comments", id] => {
                 let id: u64 = id.parse()?;

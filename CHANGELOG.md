@@ -11,6 +11,13 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The Forgejo weekly sweep no longer stops at four pages of the bot's issues:
+  it reads every page within half of the pass's requests left. An unusable
+  issue or epic record (an edited comment, a pull request, a malformed
+  children list) is left for the operator instead of aborting every apply.
+  Only recorders' comments count toward a start's proof, and receipt lines
+  can no longer form a fence (docs/forges.md#the-weekly-sweep).
+
 - Forgejo weekly sweep liveness fixes: bounded summary receipts, per-issue
   read-error holds, and retry of a plan left before its dispatch claim. The
   existing opt-in and write set are unchanged.
