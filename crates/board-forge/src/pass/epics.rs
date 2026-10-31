@@ -409,20 +409,18 @@ fn newest_said<'c>(comments: &'c [Comment], bot: &str, marker: &str) -> Option<&
 }
 
 /// When the operator last spoke on the epic: their newest comment that is
-/// neither a record, a receipt, a plan nor the bot's [`DONE_MARKER`] (the
-/// pass's own, where the operator is the bot), and not edited by anyone
-/// else.
+/// neither a record, a receipt nor a plan, and not edited by anyone else.
+/// Never the bot's: where the operator is the bot, the planner's own report
+/// and the run's status comment would read as direction, and plan the epic
+/// again after every run.
 fn spoke(i: &Inputs, receipts: &[Receipt]) -> Option<OffsetDateTime> {
-    let (record, done) = (
-        format!("<!-- {DISPATCH_MARKER}: "),
-        format!("<!-- {DONE_MARKER}: "),
-    );
+    let record = format!("<!-- {DISPATCH_MARKER}: ");
     (i.comments.iter())
         .filter(|c| {
             is(c.author.as_deref(), &[i.operator])
+                && !is(c.author.as_deref(), &[i.bot])
                 && (!(c.edited || c.editor.is_some()) || is(c.editor.as_deref(), &[i.operator]))
                 && !c.body.starts_with(&record)
-                && !c.body.starts_with(&done)
                 && !receipts.iter().any(|r| r.url == c.url)
                 && !has_fence(&c.body, PLAN_FENCE)
                 && !has_fence(&c.body, EPIC_PLAN_FENCE)
@@ -747,7 +745,7 @@ pub(super) fn decide(i: &Inputs) -> Next {
         .and_then(|before| changed(before, &epic_apply::fingerprint_pairs(&i.epic.census)));
     let Some(why) = change else {
         return Next::Idle(format!(
-            "plan {id} applied; nothing changed since {}",
+            "plan {id} applied; nothing changed since {}, so it is not planned again",
             stamp(at)
         ));
     };
