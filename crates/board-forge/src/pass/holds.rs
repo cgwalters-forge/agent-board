@@ -106,6 +106,8 @@ pub enum HoldKind {
     Dispatched,
     /// Its last triage or planning request is too recent to ask again.
     TriageCooldown,
+    /// An epic due to be planned, behind `epics.focus`.
+    Focus,
     /// An epic's planning request got no plan: the operator's once its one
     /// retry got none either ([`Hold::operator`]).
     EpicUnplanned,
@@ -155,6 +157,7 @@ impl HoldKind {
             Self::InFlight => "in-flight",
             Self::Dispatched => "dispatched",
             Self::TriageCooldown => "triage-cooldown",
+            Self::Focus => "focus",
             Self::EpicUnplanned => "epic-unplanned",
             Self::NeedsOperator => "needs-operator",
             Self::EpicNotLive => "epic-not-live",
@@ -196,7 +199,7 @@ impl HoldKind {
     /// on the operator, already the operator's to see), on a pull request,
     /// a run or a date (`closed`, `waiting-on`, `pr-open`, `in-flight`,
     /// `dispatched`, `triage-cooldown`), on an epic or a triage scope
-    /// (`epic-not-live`, `outside-epics`), or are no hold at all
+    /// (`focus`, `epic-not-live`, `outside-epics`), or are no hold at all
     /// (`overlap-ignored`, `stalled`). The holds of every new run are
     /// pacing, which the idle alarm covers.
     pub fn stalls(self) -> bool {
