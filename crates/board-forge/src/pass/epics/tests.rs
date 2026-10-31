@@ -2051,6 +2051,42 @@ fn decide_coalesces_changes_but_not_direction() {
         let got = format!("{next:?}");
         assert!(got.starts_with(expected), "{now}: {got}");
     }
+    // Only a wait after a plan that did something may be cut short, and a
+    // plan that does something after an empty one lets it again.
+    let acted = {
+        let detail = json!({"schema": epic_apply::RECEIPT_SCHEMA, "plan": receipt[0].detail.plan,
+            "outcome": "applied", "actions": receipt[0].detail.actions, "fingerprint": baseline});
+        let body = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER);
+        note(30, "cgwalters-bot", "2026-10-23T14:00:00Z", &body)
+    };
+    assert!(!receipt[0].detail.actions.is_empty());
+    for (extra, early) in [
+        (vec![], true),
+        (vec![nothing(1)], false),
+        (vec![nothing(1), nothing(2)], false),
+        (vec![nothing(1), acted], true),
+    ] {
+        let mut all = recorded.clone();
+        all.extend(extra);
+        let next = decide(&Inputs {
+            epic: &facts,
+            comments: &all,
+            operator: "cgwalters",
+            bot: "cgwalters-bot",
+            busy: None,
+            now: at("2026-10-23T15:00:00Z"),
+            follow_up_days: 3,
+            direction: None,
+        });
+        let Next::Wait {
+            early: got, hold, ..
+        } = next
+        else {
+            panic!("{next:?}");
+        };
+        assert_eq!(got, early, "{hold:?}");
+        assert_eq!(hold.reason.ends_with(NOT_EARLY), !early, "{hold:?}");
+    }
     // The operator's direction: its hash in the record of the request the
     // applied plan answered, the hash this pass read, and the request that
     // a change led to, not yet answered.
@@ -2184,6 +2220,28 @@ fn idle_pass_plans_a_waiting_epic_early() {
             vec![WAIT_890, EARLY_890],
         ),
         (
+            // tracker#786 on 31 October: five re-plans, two with nothing to do.
+            "its last plan had nothing to do: tracker#890 waits out the backoff",
+            Box::new(move |r, c| {
+                quiet(r);
+                idle(r, c);
+                let comments = r#""after":null,"name":"tracker","number":890,"#;
+                let nodes = &mut crate::pass::tests::answer(r, comments)["data"]["repository"]["issue"]
+                    ["comments"]["nodes"];
+                let nodes = nodes.as_array_mut().unwrap();
+                let detail = json!({"schema": epic_apply::RECEIPT_SCHEMA, "plan": PLAN_890,
+                    "outcome": "applied", "actions": []});
+                let mut node = nodes.last().unwrap().clone();
+                node["url"] =
+                    "https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-7000000098"
+                        .into();
+                node["author"] = json!({"login": "cgwalters-bot"});
+                node["body"] = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER).into();
+                nodes.push(node);
+            }),
+            vec![WAIT_890, IDLE],
+        ),
+        (
             "busy: stage 4 takes every slot and tracker#890 waits its day",
             Box::new(move |r, _| quiet(r)),
             vec![WAIT_890],
@@ -2243,6 +2301,9 @@ fn idle_pass_plans_a_waiting_epic_early() {
         assert_eq!(lines.len(), expected.len(), "{name}: {lines:#?}");
         for (line, start) in lines.iter().zip(&expected) {
             assert!(line.starts_with(start), "{name}: {line}");
+        }
+        if name.starts_with("its last plan had nothing") {
+            assert!(lines[0].ends_with(NOT_EARLY), "{}", lines[0]);
         }
         // The early start's hold is taken back; a waiting one stays.
         let early = expected.contains(&EARLY_890);

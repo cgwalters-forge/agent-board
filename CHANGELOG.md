@@ -11,6 +11,10 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- An idle pass no longer re-plans an epic early after a plan that had nothing
+  to do: the change waits out the backoff, then plans it
+  (docs/pass.md#epic-planning-and-recovery).
+
 - An epic asked about that is not on the board is still commented on and
   labelled, and no longer fails the pass on every run for having no Why to
   set (docs/pass.md#what-is-built).
