@@ -212,10 +212,9 @@ an empty collection or a nested setting, with
 `unsupported_capability: OPTION: REASON` from the contract, before token lookup.
 It also temporarily rejects `holds`, usage publication
 (`usage.repository`/`usage.issue`) and `usage.probe` (#523). Leases and reruns
-are accepted, and so is `sweep` ([below](#the-weekly-sweep)). Revisit
-remains deferred: a follow-up to #513 must own its scheduling semantics; it
-is not silently enabled by this preview or claimed as built by the native
-adapters.
+are accepted, and so is `sweep` ([below](#the-weekly-sweep)). Optional
+spare-capacity revisits are built on the same stage 4 path
+([below](#native-revisits)). Nothing activates a caller.
 
 Stage 1 accepts broker-only `usage: {"url": "http://broker.internal/usage"}`;
 GitHub still requires its publication repository and issue. It reuses the
@@ -248,7 +247,7 @@ an item whose match cannot be read is held, as an unreadable hold is today.
 A preview's stage 4 applies the GitHub pass's rules to what it reads of this
 instance, in the same order, and prints the same lines: `hold wip|pools|budget: …`,
 `candidates: N (…)`, `hold OWNER/REPO#N: why`, and `wip: no slot left; …`.
-It reads no plan, so where GitHub would print `start triage|implement …`, it
+Without `revisit` it reads no plan, so where GitHub would print `start triage|implement …`, it
 prints `would start OWNER/REPO#N pool=P` (or `held by --max-dispatch: would
 start …`), choosing the pool from stage 1's snapshot.
 
@@ -329,7 +328,8 @@ dispatch. Stage 4 uses one existing claim/reservation protocol, in order:
 
 1. Read the newest job-plan comment by a recorder id, unedited under the
    comment rules below. Validate its target, kind, runner and configured pool.
-   No plan holds for a person; it does not synthesize a triage plan. Stacked
+   No plan holds for a person in normal scheduling; only an enabled, due
+   [revisit](#native-revisits) synthesizes a triage plan. Stacked
    plans are held because Forgejo stack resolution is not wired.
 2. Admit a unique `run: 0` lease reservation, then `BoardOperation::Claim`.
 3. Reread the thread and claim, membership, labels, dependencies, matching
@@ -365,6 +365,44 @@ both caps are required and serialization against the schedule is not promised.
 These bounded observations are not an atomic cross-workflow lock: deployments
 must serialize pass invocations. Status and snapshots are not part of this
 applying slice (#523); other refusals remain in force.
+
+### Native revisits
+
+`revisit` is absent/off by default. After normal work, spare WIP capacity may
+take at most `perPass` revisits (1–5), using `afterDays` and `heldAfterDays`
+(1–90) and `pools`, falling back to `triagePools`. The shared weight/sample
+rules draw at most three candidates per requested revisit, seeded by the
+Actions pass id or injected pass clock. Native issue listings supply
+`updated_at`; a missing or invalid time never becomes silence. Held issues
+use the held interval and may be triaged despite human holds or dependencies,
+but unreadable Priority, labels, dependencies or pull requests, an active run
+or matching pull request still prevent a revisit. Revisit triage scope must
+be `all` (`triage: true`).
+
+With revisits configured, both preview and apply read plans to separate normal
+work from revisits before spending capacity. A missing normal plan holds
+without failing the pass. A revisit admission attempt keeps its per-pass
+allowance and slot if a later bind or receipt write fails: that failure cannot
+authorize another start.
+
+The concrete record threat is an issue writer editing or impersonating a
+prior plan/verdict to suppress or repeat work. The bounded native thread read
+requires recorder ids and unedited recorder comments, as claims already do.
+The newest recorder revisit request enforces its interval; a subsequent
+unedited bot verdict plus unchanged input fingerprint holds it for up to 90
+days. Foreign records cannot supply either fact. Pending, malformed or
+ambiguously started plans hold rather than being replaced. No GitHub comment
+or identity I/O is reused.
+
+Preview reads these facts but writes nothing. Apply appends an unedited triage
+plan carrying its fingerprint, then calls the existing stage 4
+claim/admit/start/receipt/recovery path, including final rechecks, serialization,
+WIP, leases, pacing and caps. Plan plus normal start needs five write slots;
+an interrupted unclaimed plan waits for a person, and an ambiguous start is
+never dispatched again. There is no new dispatch implementation, deployment,
+secret or caller activation. PR follow-up remains refused. The
+[weekly sweep](#the-weekly-sweep) requires triage scope `epics`, in which
+revisits do not run.
 
 ### Labels and Status
 
