@@ -559,7 +559,8 @@ appended, never edited:
   "due": T, "issues": […]}`). Only the bot's earliest such comment counts. It
   comes before the run's dispatch, so a run posting as the bot cannot replace
   it. The issue's server-set `created_at` decides whether this week's sweep
-  was filed, so at most one is filed in each week. If the create's reply is
+  was filed, so at most one is filed in each week. The list's `due` is
+  informational; the server-set creation time decides the week. If the create's reply is
   lost, or the pass stops before the record, the next pass finds an open
   sweep with no list. That sweep is stuck: nothing is filed again, and
   nothing is guessed.
@@ -568,7 +569,12 @@ appended, never edited:
   leases, caps, final recheck and recovery. The run starts only after
   stage 4's own starts, and only with a slot free, every `triagePools` pool
   under its pace and the budget not reached. A claim with no receipt is
-  recovered and never started again.
+  recovered and never started again. An unclaimed plan is reused only if it
+  is the issue's only plan fence, posted by the bot with the sweep intro and
+  the exact sweep brief, a triage kind, hosted runner and a `triagePools`
+  pool, with no dispatch claim or receipt anywhere on the issue. Otherwise
+  a person dispatches it. Reuse checks slots and pools again, without
+  another plan; a run cannot post a plan to start another run itself.
 * **The reply.** Once the run is no longer in flight, the reply is the
   bot's newest comment after the dispatch claim that holds the
   `agent-board-sweep-verdicts` block.
@@ -588,6 +594,12 @@ appended, never edited:
   is.
   A later pass reads the claim's receipt. It then adds the label or close
   where a pass stopped before it, and otherwise waits for the operator.
+  Receipt lines summarise long reasons/questions; the reply keeps the full
+  text. An oversized receipt leaves `attached` empty and adds `attached_count`.
+  A missing or permission-denied issue or epic, or a closed epic, is left
+  for the operator, not attached. Other read failures abort the apply for
+  a later pass to retry, with the cause in its error line. Non-attach
+  verdicts need no issue thread read.
 * **Recovery.** A claim with no receipt is an apply that was cut short. The
   pass reads the claimed reply again and checks each attach against both
   issues as they are now. An attach with both sides is done. One where only
@@ -610,6 +622,8 @@ naming another issue, a plan or claim that cannot be read, no reply, or
 verdicts that cannot be read. A stuck sweep gets the `needs-human` label,
 one write that is added and read back beside the issue's other labels
 (`BoardOperation::Label` takes `needs-human` as its own scope). A sweep issue
+requires the `needs-human` label to already exist in `sweep.repository`; the
+pass never creates labels. A sweep issue
 outside `board.repositories` may have neither the membership label nor the
 board's other rules. Its writes therefore go through stage 3's writer, which
 reaches the work repositories' open issues.

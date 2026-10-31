@@ -11,6 +11,10 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Forgejo weekly sweep liveness fixes: bounded summary receipts, per-issue
+  read-error holds, and retry of a plan left before its dispatch claim. The
+  existing opt-in and write set are unchanged.
+
 - An idle pass no longer re-plans an epic early after a plan that had nothing
   to do: the change waits out the backoff, then plans it
   (docs/pass.md#epic-planning-and-recovery).

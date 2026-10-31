@@ -963,6 +963,15 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             self.line(format!("run rerun {}: {line}", facts.issue.display()));
             return Ok(sent);
         }
+        if self.is_sweep(&facts.issue) {
+            let (_, thread) = self
+                .epic_forge()
+                .issue_thread(&self.write_identity(&facts.issue))?;
+            ensure!(
+                self.sweep_start_record(&facts.issue, &thread, Some(&accepted)),
+                "sweep start is not provable; a person dispatches it"
+            );
+        }
         if accepted.plan.pool.is_empty() {
             accepted.plan.pool = pool.into();
         }

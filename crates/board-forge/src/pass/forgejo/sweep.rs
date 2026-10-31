@@ -22,6 +22,10 @@ const APPLIED_FENCE: &str = "agent-board-sweep-applied";
 const APPLIED_SCHEMA: &str = "agent-board/sweep-applied/v1";
 /// Requests one write may take with its reads ([`Forge::board_write`]).
 const WRITE_REQUESTS: usize = 12;
+/// Leave room under the writer's 16,000-character limit for its receipt marker.
+const RECEIPT_BODY_LIMIT: usize = 15_900;
+/// The full question/reason remains in the reply; receipts are only a summary.
+const LEFT_LINE_LIMIT: usize = 140;
 
 /// An issue's label names.
 fn names(issue: &Value) -> Result<Vec<String>> {
@@ -41,6 +45,14 @@ fn marked<'b>(body: &'b str, marker: &str) -> Option<&'b str> {
     first_line(body)
         .strip_prefix(&format!("<!-- {marker}: "))?
         .strip_suffix(" -->")
+}
+
+/// These reads need a person; transport and request-budget errors may retry.
+fn unavailable(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NotFound>().is_some()
+        || error
+            .downcast_ref::<crate::forgejo::AuthenticationRequired>()
+            .is_some()
 }
 
 /// The listed issues of the sweep issue `number`'s list record: the bot's
@@ -422,7 +434,15 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                         && plan::has_fence(text(c, "/body"), PLAN_FENCE)
                 }) =>
             {
-                return self.sweep_start(found, &labels, &listed, free, snapshot);
+                if self.sweep_start_record(&found.issue, &thread, None) {
+                    return self.sweep_start(found, &labels, &listed, free, snapshot, false);
+                }
+                self.sweep_stuck(
+                    found,
+                    &labels,
+                    "its start is not provable; a person dispatches it",
+                );
+                return Ok(0);
             }
             Err(error) => {
                 let why = format!("its plan cannot be used: {error:#}; a person replaces it");
@@ -433,11 +453,14 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let claim = match self.claim(&item, accepted.id) {
             Ok(Some(claim)) => claim,
             Ok(None) => {
-                let why = format!(
-                    "its plan {} has no dispatch claim; a person dispatches it",
-                    accepted.id
+                if self.sweep_start_record(&found.issue, &thread, Some(&accepted)) {
+                    return self.sweep_start(found, &labels, &listed, free, snapshot, true);
+                }
+                self.sweep_stuck(
+                    found,
+                    &labels,
+                    "its start is not provable; a person dispatches it",
                 );
-                self.sweep_stuck(found, &labels, &why);
                 return Ok(0);
             }
             Err(error) => {
@@ -511,6 +534,41 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             .collect()
     }
 
+    /// Only the pass's first, unclaimed start may be resumed. Runs post as
+    /// the bot too: a later plan must never become another dispatch path.
+    pub(super) fn sweep_start_record(
+        &self,
+        issue: &ItemRef,
+        thread: &[Value],
+        accepted: Option<&Accepted>,
+    ) -> bool {
+        if thread.iter().any(|c| {
+            let body = text(c, "/body");
+            marked(body, plan::DISPATCH_MARKER).is_some() || marked(body, RECEIPT_MARKER).is_some()
+        }) {
+            return false;
+        }
+        let plans: Vec<_> = thread
+            .iter()
+            .filter(|c| plan::has_fence(text(c, "/body"), PLAN_FENCE))
+            .collect();
+        let Some(accepted) = accepted else {
+            return plans.is_empty();
+        };
+        let [comment] = plans.as_slice() else {
+            return false;
+        };
+        let job = &accepted.plan;
+        comment["id"].as_u64() == Some(accepted.id)
+            && comment["user"]["id"].as_u64() == Some(self.ids.bot)
+            && text(comment, "/body").starts_with(&format!("{} At ", shared::SWEEP_INTRO))
+            && job.kind == "triage"
+            && job.runner == TRIAGE_RUNNER
+            && self.config.triage_pools().contains(&job.pool)
+            && job.brief
+                == shared::brief(&self.web(issue), &self.config.operator, &self.sweep_epics())
+    }
+
     /// The sweep's run, below all other work: its triage plan posted and
     /// started through stage 4's claim and start path, with a slot left
     /// after stage 4's starts and every triage pool under its pace.
@@ -521,6 +579,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         listed: &[String],
         free: usize,
         snapshot: Option<&Value>,
+        planned: bool,
     ) -> Result<usize> {
         let config = self.config;
         let url = &found.url;
@@ -594,9 +653,10 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             self.line(format!("sweep {url}: {why}"));
             return Ok(0);
         }
-        // The plan's comment, the lease, claim, bind and receipt.
-        if let Some(held) =
-            (self.caps.check(Kind::Dispatch)).or_else(|| self.caps.check_many(Kind::Write, 5))
+        // Reuse only the verified first start; apply rechecks it at admission.
+        // The optional plan comment, the lease, claim, bind and receipt.
+        if let Some(held) = (self.caps.check(Kind::Dispatch))
+            .or_else(|| self.caps.check_many(Kind::Write, 4 + usize::from(!planned)))
         {
             self.line(format!("{held}: {line}"));
             return Ok(0);
@@ -613,9 +673,12 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         );
         let item = self.sweep_item(found, labels);
         let forge = self.epic_forge();
-        let started = self
-            .write_on(&forge, issue, labels, BoardOperation::Comment { body })
-            .and_then(|()| self.apply(&item, &pool, snapshot));
+        let posted = if planned {
+            Ok(())
+        } else {
+            self.write_on(&forge, issue, labels, BoardOperation::Comment { body })
+        };
+        let started = posted.and_then(|()| self.apply(&item, &pool, snapshot));
         match started {
             Ok(true) => Ok(1),
             Ok(false) => Ok(0),
@@ -698,6 +761,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let sweep = &found.issue.repository;
         let mut out = Applying::default();
         let mut epics = Epics::new();
+        let mut unreadable = BTreeMap::<String, String>::new();
         let mut additions = BTreeMap::<String, usize>::new();
         let mut read = BTreeMap::new();
         for (issue, verdict) in verdicts {
@@ -720,6 +784,21 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 ));
                 continue;
             }
+            let Verdict::Attach(epic) = verdict else {
+                // Closure since the reply settles it, without trusting or
+                // reading any of its comments for a non-attach verdict.
+                let path = format!("issues/{}", issue.number);
+                let url = api(self.board, &issue.repository, &path, &[])?;
+                match self.client.get(&url) {
+                    Ok(r) if r.body["state"] == "closed" => continue,
+                    Ok(_) => out.left.push(format!("- {name}: {}", said())),
+                    Err(error) if unavailable(&error) => out
+                        .left
+                        .push(format!("- {name}, cannot be read ({error:#}): {}", said())),
+                    Err(error) => return Err(error).with_context(|| format!("reading {name}")),
+                }
+                continue;
+            };
             let child = IssueRef {
                 repo: issue.repository.clone(),
                 number: issue.number,
@@ -731,34 +810,65 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                     out.left.push(format!("- {name}, not found: {}", said()));
                     continue;
                 }
-                Err(error) => return Err(error.context(format!("reading {name}"))),
+                Err(error) if unavailable(&error) => {
+                    out.left
+                        .push(format!("- {name}: its records cannot be read: {error:#}"));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {name}'s records"));
+                }
             };
             // Settled since: the operator closed it.
             if value["state"] != "open" {
                 continue;
             }
-            let Verdict::Attach(epic) = verdict else {
-                out.left.push(format!("- {name}: {}", said()));
-                continue;
-            };
             let epic = IssueRef {
                 repo: epic.repository.clone(),
                 number: epic.number,
             };
             let to = epic.to_string().to_ascii_lowercase();
-            if !epics.contains_key(&to) {
+            if !epics.contains_key(&to) && !unreadable.contains_key(&to) {
                 let at = self.write_identity(&self.item(&epic));
-                let (value, thread) = forge
-                    .issue_thread(&at)
-                    .with_context(|| format!("reading the epic {epic}"))?;
-                ensure!(value["state"] == "open", "the epic {epic} is not open");
-                let labels = names(&value)?;
-                let children = relations::children(&thread, bot, epic.number)?;
-                epics.insert(to.clone(), (labels, children));
+                match forge.issue_thread(&at) {
+                    Ok((value, thread)) if value["state"] == "open" => {
+                        epics.insert(
+                            to.clone(),
+                            (
+                                names(&value)?,
+                                relations::children(&thread, bot, epic.number)?,
+                            ),
+                        );
+                    }
+                    Ok(_) => {
+                        unreadable.insert(to.clone(), "the epic is not open".into());
+                    }
+                    Err(error) if unavailable(&error) => {
+                        unreadable.insert(to.clone(), format!("{error:#}"));
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("reading epic {epic}"));
+                    }
+                }
+            }
+            if let Some(why) = unreadable.get(&to) {
+                out.left.push(format!(
+                    "- {name}: the epic {epic} is not readable and open: {why}"
+                ));
+                continue;
             }
             let named = child.to_string();
             let lists = (epics[&to].1.iter()).any(|c| c.to_string().eq_ignore_ascii_case(&named));
-            let side = match relations::parent(&thread, bot)? {
+            let parent = match relations::parent(&thread, bot) {
+                Ok(parent) => parent,
+                Err(error) => {
+                    out.left.push(format!(
+                        "- {name}: its parent record cannot be read: {error:#}"
+                    ));
+                    continue;
+                }
+            };
+            let side = match parent {
                 None => Side::None,
                 Some(p) if p.to_string().eq_ignore_ascii_case(&to) && lists => Side::Both,
                 Some(p) if p.to_string().eq_ignore_ascii_case(&to) => Side::Child,
@@ -967,10 +1077,30 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             body.push_str(&format!(
                 "\nFor {}, who closes this issue once they are settled:\n\n{}\n",
                 self.config.operator,
-                plan.left.join("\n")
+                plan.left
+                    .iter()
+                    .map(|line| {
+                        let mut short: String = line.chars().take(LEFT_LINE_LIMIT).collect();
+                        if line.chars().count() > LEFT_LINE_LIMIT {
+                            short.push('…');
+                        }
+                        short
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
         body.push_str(&format!("\n```{APPLIED_FENCE}\n{detail:#}\n```\n"));
+        if body.chars().count() > RECEIPT_BODY_LIMIT {
+            // Long identities or many successful attaches can overflow too.
+            // Keep the recoverable counts, not repeated agent-controlled text.
+            let detail = json!({"schema": APPLIED_SCHEMA, "reply": reply_id,
+                "outcome": outcome, "attached": [], "attached_count": plan.done.len(),
+                "left": plan.left.len()});
+            body = format!(
+                "Sweep summary; full verdicts are in reply {reply_id}.\n\n```{APPLIED_FENCE}\n{detail:#}\n```\n"
+            );
+        }
         let receipt = BoardOperation::Receipt {
             marker: SWEEP_APPLY_MARKER.into(),
             plan: reply_id,
