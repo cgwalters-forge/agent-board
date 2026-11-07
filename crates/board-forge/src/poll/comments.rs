@@ -4047,6 +4047,7 @@ pub(super) mod tests {
                 previous: BTreeMap::new(),
                 used: BTreeMap::new(),
                 remaining,
+                cut: None,
                 apply: Some(apply),
                 dispatched: 0,
                 merged: 0,
