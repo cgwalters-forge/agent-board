@@ -771,7 +771,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // A fix of the bot's own PR needs neither a topic-selected fork nor
         // a tracking issue. Its round marker is the acknowledgement/receipt.
         let mut records = comments.to_vec();
-        if mine && self.config.policy.operator_review_fixes {
+        if mine && (self.config.policy.operator_review_fixes || self.config.policy.operator_intents)
+        {
             // The old route kept its receipts on the tracking issue. Classify
             // only direction still open there before requiring a fork for it.
             records.extend(self.tracked(repo, number, true)?.comments());
@@ -785,7 +786,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // Revisit a completed review through the same path too, rather than
         // making a now-unnecessary fork admission hold its discovery cursor.
         let candidates = if unread.is_empty() { &said } else { &unread };
-        if mine && comments::review_fix(&self.config.policy, candidates) {
+        if mine
+            && (comments::review_fix(&self.config.policy, candidates)
+                || (self.config.policy.operator_intents
+                    && comments::direct_intent(candidates) != comments::DirectIntent::Classify))
+        {
             return Ok(self
                 .thread_read_from(repo, issue, comments, false, (since, true, admission_floor))?
                 .unwrap_or((true, "notification: operator review already handled".into())));
@@ -1981,10 +1986,148 @@ mod tests {
     }
 
     #[test]
+    fn operator_intents_policy_table() {
+        for (value, expected) in [
+            (json!({}), Some(false)),
+            (json!({"operatorIntents": false}), Some(false)),
+            (json!({"operatorIntents": true}), Some(true)),
+            (json!({"operatorIntents": "true"}), None),
+            (json!({"operatorIntents": null}), None),
+        ] {
+            assert_eq!(
+                PollPolicy::from_json(&value)
+                    .ok()
+                    .map(|p| p.operator_intents),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn operator_intents_preserve_ship_and_dco_request_without_triage() {
+        const BODY: &str =
+            "…whatever let's ship. It can always clean it up later. You can add my DCO";
+        let repo = "other/app";
+        let fake = intake_github(repo, true, "comment", OPERATOR);
+        fake.rest
+            .borrow_mut()
+            .get_mut(&format!("{API_ROOT}repos/{repo}/issues/2"))
+            .unwrap()["user"]["login"] = BOT.into();
+        fake.page(
+            &format!("repos/{repo}/issues/2/comments?per_page=100"),
+            json!([]),
+        );
+        let mut review = said(5862878257, OPERATOR, UPDATED, BODY);
+        review["state"] = "APPROVED".into();
+        fake.page(
+            &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
+            json!([review]),
+        );
+        fake.page(
+            &format!("repos/{repo}/pulls/2/comments?per_page=100"),
+            json!([]),
+        );
+        let mut config = search_intake(&fake, repo);
+        config.policy.operator_intents = true;
+        config.policy.own_space_only = true;
+        for (apply, search) in [(false, true), (true, true), (false, false), (true, false)] {
+            if !search {
+                config.policy.notification_intake = None;
+                config.policy.operator_comments = vec![repo.into()];
+            }
+            let result = pass(&fake, &config, State::default(), apply);
+            assert_eq!(result.errors, 0, "{:?}", result.lines);
+            let line = result
+                .lines
+                .iter()
+                .find(|l| l.contains("intent=signoff-and-ship"));
+            assert!(line.is_some(), "{:?}", result.lines);
+            println!(
+                "{}: {}",
+                if apply {
+                    "apply harness"
+                } else {
+                    "preview harness"
+                },
+                line.unwrap()
+            );
+            assert!(dispatches(&fake).is_empty());
+            assert!(fake.writes.borrow().is_empty());
+            if apply && search {
+                assert!(
+                    !result.state.intake_waiting.is_empty(),
+                    "request must remain retryable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn operator_intents_ambiguous_commands_do_not_enter_shipping_route() {
+        for body in [
+            "Before you merge it, fix the failing tests",
+            "Avoid saying ship it in the release notes",
+            "Ship it. First resolve the failing tests.",
+            "You can add my DCO. After resolving the failures.",
+            "“Ship it”",
+        ] {
+            let repo = "other/app";
+            let fake = intake_github(repo, true, "comment", OPERATOR);
+            fake.rest
+                .borrow_mut()
+                .get_mut(&format!("{API_ROOT}repos/{repo}/issues/2"))
+                .unwrap()["user"]["login"] = BOT.into();
+            fake.page(
+                &format!("repos/{repo}/issues/2/comments?per_page=100"),
+                json!([said(11, OPERATOR, UPDATED, body)]),
+            );
+            let mut config = search_intake(&fake, repo);
+            config.policy.operator_intents = true;
+            config.policy.notification_intake =
+                Some(BTreeMap::from([(repo.into(), DISPATCH.into())]));
+            let result = pass(&fake, &config, State::default(), true);
+            assert_eq!(result.errors, 0, "{:?}", result.lines);
+            assert!(
+                result
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("intent=unclassified") && l.contains("triage")),
+                "{:?}",
+                result.lines
+            );
+            assert!(
+                !result.lines.iter().any(|l| l.contains("intent=ship")),
+                "{:?}",
+                result.lines
+            );
+            assert_eq!(dispatches(&fake).len(), 1);
+            assert_eq!(dispatches(&fake)[0]["kind"], "triage");
+        }
+    }
+
+    #[test]
     fn operator_review_fixes_route_only_changes_requested_on_our_pr() {
         const SHIP: &str =
             "…whatever let's ship. It can always clean it up later. You can add my DCO";
         for (enabled, author, reviewer, state, body, mixed, fix) in [
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "STALE_HEAD",
+                "Please fix this typo.",
+                false,
+                true,
+            ),
+            (
+                true,
+                BOT,
+                OPERATOR,
+                "MISSING_HEAD",
+                "Please fix this typo.",
+                false,
+                true,
+            ),
             (
                 true,
                 BOT,
@@ -2092,11 +2235,19 @@ mod tests {
                 },
             );
             let mut review = said(5862878257, reviewer, UPDATED, body);
+            if state != "MISSING_HEAD" {
+                review["commit_id"] = if state == "STALE_HEAD" {
+                    "old-head"
+                } else {
+                    "abcdef0123456789"
+                }
+                .into();
+            }
             let superseded = matches!(
                 state,
                 "SUPERSEDED" | "REREQUESTED" | "REREQUESTED_SAME_SECOND"
             );
-            review["state"] = if superseded {
+            review["state"] = if superseded || matches!(state, "STALE_HEAD" | "MISSING_HEAD") {
                 "CHANGES_REQUESTED"
             } else {
                 state
@@ -2122,6 +2273,7 @@ mod tests {
                         "Please fix only the remaining typo.",
                     );
                     request["state"] = "CHANGES_REQUESTED".into();
+                    request["commit_id"] = "abcdef0123456789".into();
                     reviews.push(request);
                     // Eligibility is chronological, not API array order.
                     reviews.reverse();
@@ -2138,6 +2290,7 @@ mod tests {
             fake.page(
                 &format!("repos/{repo}/pulls/2"),
                 json!({
+                "state": "open", "user": {"login": BOT},
                 "head": {"sha": "abcdef0123456789"}, "labels": []}),
             );
             let mut config = search_intake(&fake, repo);
@@ -2180,6 +2333,9 @@ mod tests {
                 assert_eq!(runs[0]["repo"], repo);
                 assert_eq!(runs[0]["item"], "2");
                 assert!(text(&runs[0], "/task").contains(body));
+                // Outstanding change direction survives a rebase; the actual
+                // round is pinned to the fresh head, not the reviewed commit.
+                assert!(text(&runs[0], "/task").contains("abcdef0123456789"));
                 assert!(
                     !fake
                         .writes
@@ -2209,6 +2365,7 @@ mod tests {
                     "Please fix the remaining typo.",
                 );
                 review["state"] = "CHANGES_REQUESTED".into();
+                review["commit_id"] = "abcdef0123456789".into();
                 fake.rest
                     .borrow_mut()
                     .get_mut(&format!(
@@ -2234,6 +2391,9 @@ mod tests {
     fn operator_review_fixes_keep_existing_holds_and_caps() {
         for case in [
             "label",
+            "hold",
+            "closed",
+            "foreign author",
             "rounds",
             "running",
             "dispatch cap",
@@ -2262,6 +2422,7 @@ mod tests {
             );
             let mut review = said(22, OPERATOR, UPDATED, "Please fix the typo.");
             review["state"] = "CHANGES_REQUESTED".into();
+            review["commit_id"] = "abcdef0123456789".into();
             fake.page(
                 &format!("repos/{repo}/pulls/2/reviews?per_page=100"),
                 json!([review]),
@@ -2273,7 +2434,13 @@ mod tests {
             fake.page(
                 &format!("repos/{repo}/pulls/2"),
                 json!({"head": {"sha": "abcdef0123456789"},
-                "labels": if case == "label" { json!([{"name": LABEL}]) } else { json!([]) }}),
+                "state": if case == "closed" { "closed" } else { "open" },
+                "user": {"login": if case == "foreign author" { "someone" } else { BOT }},
+                "labels": match case {
+                    "label" => json!([{"name": LABEL}]),
+                    "hold" => json!([{"name": "HoLd"}]),
+                    _ => json!([]),
+                }}),
             );
             let mut config = search_intake(&fake, repo);
             config.policy.operator_review_fixes = true;
@@ -2312,6 +2479,24 @@ mod tests {
                 "{case}: {:?}",
                 fake.writes.borrow()
             );
+            if case == "hold" {
+                assert!(
+                    !outcome.state.intake_waiting.is_empty(),
+                    "{:?}",
+                    outcome.lines
+                );
+                fake.rest
+                    .borrow_mut()
+                    .get_mut(&format!("{API_ROOT}repos/{repo}/pulls/2"))
+                    .unwrap()["labels"] = json!([]);
+                let released = pass(&fake, &config, outcome.state, true);
+                assert_eq!(released.errors, 0, "{:?}", released.lines);
+                assert_eq!(dispatches(&fake).len(), 1, "{:?}", released.lines);
+                assert_eq!(dispatches(&fake)[0]["kind"], "fix");
+                let again = pass(&fake, &config, released.state, true);
+                assert_eq!(again.errors, 0, "{:?}", again.lines);
+                assert_eq!(dispatches(&fake).len(), 1, "{:?}", again.lines);
+            }
         }
     }
 
