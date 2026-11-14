@@ -10,6 +10,76 @@ the caller's dispatch workflow ([dispatch](dispatch.md)).
 
 ## One pass
 
+### Agent recovery instead of operator parking (#992)
+
+The concrete failure is a moving merge queue or an exhausted engineering budget
+turning ordinary bot work into an operator review request, after which the poll
+stops following it. `pr.agentRecovery: true` in pass (`agentRecovery: true` in
+standalone poll) enables one recovery path; it is **off by default**. Existing
+explicit labels, requested operator reviews, missing-data holds, dependencies,
+head/author scope, review provenance and merge gates remain gates. Removing a
+historical parking label or review request resumes following the PR using the
+existing stopped-marker reset; the poll does not remove anybody's hold itself.
+
+With recovery enabled, a queue `merge_conflict` is a failed rebase-fix task, not
+another queue retry, even when GitHub currently reports the head clean. The task
+explicitly rebases onto its base and stays within the fix budget. A changed head
+needs fresh review/checks before requeueing. Before admitting an overlapping PR,
+the poll waits for the earlier entry to leave the queue, also for clean approved
+heads. The existing bounded queue/file reads treat incomplete listings as overlap;
+entries admitted earlier in this pass participate too. Disjoint entries still
+proceed. Applying callers must continue serializing passes. Manual/unknown queue
+removals remain explicit stops, not permission to requeue.
+
+Exhausted fix, continuation, rebase and queue-retry budgets dispatch `kind=triage`
+through the existing caller workflow instead of writing `needs-human` or requesting
+operator review. This replaces the diagnostic/refit extra round when recovery is
+enabled. Triage uses the existing triage pool selection and pacing, dispatch/write
+caps, shared-head and fix scope checks. Its bot-owned marker is claimed and written
+**before** dispatch; an ambiguous dispatch is never sent again. At most two triage
+runs and one grant of fresh configured repair budgets are permitted between
+explicit human resets. A failed first triage or an exhausted grant can use the
+second triage; it cannot grant rounds twice. Corrupt reservation data fails closed.
+
+The brief asks triage to record evidence and choose obsolete (close), replan (open
+a fresh issue with an implement plan, then close linking it), more rounds, or a
+truly architectural question. Closure and issue creation remain proposals for
+**agentic-job's independent safe-output check/apply**, not new poll mutation paths.
+The caller must support those checked outputs for PR-targeted triage. The agent
+has no forge credentials. Its checked comment starts with:
+
+````markdown
+```agent-board-pr-triage
+{"head":"<reserved PR head>","run":1234,"decision":"more-rounds","reason":"Evidence and why","question":null}
+```
+````
+
+Decisions are `obsolete`, `replan`, `more-rounds`, or `architecture`. Unknown fields
+or decisions, a missing/nonmatching head or run, an empty/multiline reason, and an
+architecture decision without a concrete one-line question do not authorize work.
+The comment must be bot-authored and newer than the reservation; only the newest
+result counts. It is at most 4 KiB; reason/question are at most 1,024 bytes each.
+PR bodies and visitor comments cannot grant rounds. The exact recorded caller run
+must have succeeded on the configured default-branch dispatch workflow, and the
+PR must still have the reserved head. A grant is claimed once, resets only bounded
+round/retry counters, preserves the seen-removal receipt, and rechecks the head and
+holds before writing. Only `architecture` creates an operator hold, naming the
+question. Other outcomes wait for the caller's checked closure/replanning outputs.
+A replacement head follows its own review/check gates without refunding triage
+spend; the old disposition cannot grant it rounds. Incomplete hold coverage never
+authorizes recovery, including on the final reread. Existing CI retry arbitration
+still precedes exhaustion triage, but never displaces an already-pending triage.
+Unknown dispatch outcomes, missing dispositions and the final failed triage remain
+visible machine waits, with no automatic extra spend and no operator parking.
+As with existing poll markers, trusted writers acting as the configured bot can
+impersonate a disposition; this is not protection from a compromised caller.
+
+Deployment is caller-side: `cgwalters-forge/tracker`, `.github/pass.json`, key
+`pr.agentRecovery`, value `true`. Standalone poll, if still used, needs
+`.github/poll/agent-board.json`, key `agentRecovery`, value `true`. Update the pin
+and verify the caller's triage bounds/output support before enabling. No caller
+configuration or workflow permissions are changed in this repository.
+
 ### Missing-data recovery holds
 
 The concrete failure prevented is spending another fix or continuation round on
