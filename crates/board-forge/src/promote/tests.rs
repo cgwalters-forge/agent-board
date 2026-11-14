@@ -80,6 +80,10 @@ fn timeline(replay: &mut Replay, events: Value) {
 
 fn scenario() -> Replay {
     let mut replay = Replay::from_json(&serde_json::from_str(FIXTURE).unwrap()).unwrap();
+    // Promotion metadata is a scenario fact, not part of the older recording.
+    let metadata = body(&mut replay, &format!("repos/{REPO}"));
+    metadata["topics"] = json!(["bot-midstream"]);
+    metadata["custom_properties"] = json!({"origin":"fork"});
     // Keep one observed bot-fork PR; readiness and command are scenario edits.
     let selected = body(&mut replay, "pulls?state=open")
         .as_array()
@@ -1362,7 +1366,18 @@ fn candidate_read_gates() {
         (
             "behind",
             |r| body(r, "/compare/")["behind_by"] = json!(1),
-            gate_hold("needs publication rebase (behind_by=1)"),
+            candidate(false).replace(
+                "dco=required;",
+                "dco=required; publication rebase onto main (behind_by=1), held by --apply on conflict;",
+            ),
+        ),
+        (
+            "behind, another author",
+            |r| {
+                body(r, "/compare/")["behind_by"] = json!(1);
+                body(r, "/compare/")["commits"][0]["author"]["login"] = json!("visitor");
+            },
+            gate_hold("promotion refuses another author's commit"),
         ),
         (
             "zero ahead",
@@ -1618,6 +1633,9 @@ struct PublishingForge {
     promote_ref: Rc<RefCell<Option<String>>>,
     /// Upstream PRs listed for that branch.
     promoted: RefCell<Vec<Value>>,
+    publication_checks: Value,
+    checks_by_head: BTreeMap<String, Value>,
+    checked_heads: RefCell<Vec<String>>,
 }
 
 /// A rewrite whose head is a function of the upstream base alone, so a base
@@ -1677,6 +1695,12 @@ impl Rest for PublishingForge {
             Some(json!({"login":self.writer}))
         } else if url == format!("{API}repos/{REPO}/pulls/34") {
             Some(self.fresh.clone())
+        } else if url.starts_with(&format!("{API}repos/{REPO}/rules/branches/")) {
+            Some(
+                json!([{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci","integration_id":42}]}}]),
+            )
+        } else if url.starts_with(&format!("{API}repos/{REPO}/branches/")) {
+            Some(json!({"protected":false}))
         } else if url == format!("{API}repos/{REPO}/pulls/35") {
             let mut replay = Replay {
                 now: self.replay.now,
@@ -1747,6 +1771,15 @@ impl Rest for PublishingForge {
 
 impl Transport for PublishingForge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        if query.contains("object(expression:$head)") {
+            let head = variables["head"].as_str().unwrap();
+            self.checked_heads.borrow_mut().push(head.to_owned());
+            let checks = self
+                .checks_by_head
+                .get(head)
+                .unwrap_or(&self.publication_checks);
+            return Ok(json!({"repository":{"object":{"oid":head,"statusCheckRollup":checks}}}));
+        }
         self.replay.graphql(query, variables)
     }
 }
@@ -1768,10 +1801,35 @@ fn publication() -> (PublishingForge, Config) {
         returned_number: false,
         promote_ref: Rc::new(RefCell::new(None)),
         promoted: RefCell::new(vec![]),
+        publication_checks: json!({"contexts":{"totalCount":1,"nodes":[{
+            "__typename":"CheckRun","databaseId":1,"name":"ci","status":"COMPLETED","conclusion":"SUCCESS",
+            "checkSuite":{"app":{"databaseId":42},"workflowRun":{"event":"push","workflow":{"databaseId":7}}}
+        }],"pageInfo":{"hasNextPage":false,"endCursor":null}}}),
+        checks_by_head: BTreeMap::new(),
+        checked_heads: RefCell::new(vec![]),
     };
     let mut config = Config::parse(CONFIG).unwrap();
     config.promote.as_mut().unwrap().publish = true;
     (forge, config)
+}
+
+#[test]
+fn metadata_only_preview_and_publication_use_the_parent_default() {
+    let (mut forge, mut config) = publication();
+    config.promote.as_mut().unwrap().forks.clear();
+    config.midstream = Some(pass::midstream::Midstream {
+        owner: "cgwalters-forge".into(),
+        topic: "bot-midstream".into(),
+    });
+    let metadata = body(&mut forge.replay, &format!("repos/{REPO}"));
+    metadata["parent"]["default_branch"] = json!("main");
+    let metadata = metadata.clone();
+    forge.replay.requests.push(json!({"request":{"get":format!("{API}orgs/cgwalters-forge/repos?type=public&per_page=100")},
+        "answer":{"status":200,"link":null,"body":[metadata]}}));
+    assert!(preview(&forge, &config, forge.replay.now).unwrap()[0].starts_with("would promote"));
+    assert!(forge.writes.borrow().is_empty());
+    assert!(apply(&forge, &config, forge.replay.now, 3).unwrap()[0].starts_with("promoted"));
+    assert_eq!(forge.writes.borrow()[1].2["base"], "main");
 }
 
 /// A second hypothetical PR on another branch, derived from exactly the
@@ -2234,6 +2292,138 @@ fn confirmed_publication_does_not_starve_the_next_candidate() {
     assert!(second[1].contains("#35 ->"), "{second:?}");
     assert_eq!(forge.writes.borrow().len(), 3);
     assert!(forge.writes.borrow()[0].1.contains("/issues/35/comments"));
+}
+
+#[test]
+fn publication_checks_gate_the_replayed_oid_and_resume_without_reapproval() {
+    for case in [
+        "failed",
+        "pending",
+        "missing",
+        "wrong app",
+        "no rollup",
+        "incomplete",
+        "pagination",
+        "malformed",
+    ] {
+        let (mut forge, config) = publication();
+        body(&mut forge.replay, "/compare/")["behind_by"] = json!(33);
+        let green = forge.publication_checks.clone();
+        let contexts = &mut forge.publication_checks["contexts"];
+        match case {
+            "failed" => contexts["nodes"][0]["conclusion"] = json!("FAILURE"),
+            "pending" => contexts["nodes"][0]["status"] = json!("IN_PROGRESS"),
+            "missing" => {
+                contexts["nodes"] = json!([]);
+                contexts["totalCount"] = json!(0);
+            }
+            "wrong app" => contexts["nodes"][0]["checkSuite"]["app"]["databaseId"] = json!(99),
+            "no rollup" => forge.publication_checks = Value::Null,
+            "incomplete" => contexts["totalCount"] = json!(2),
+            "pagination" => contexts["pageInfo"] = json!({"hasNextPage":true,"endCursor":"same"}),
+            "malformed" => contexts["nodes"][0]["name"] = Value::Null,
+            _ => unreachable!(),
+        }
+        let mut git = FakeRewrite::new(&forge);
+        let result = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git);
+        if ["incomplete", "pagination", "malformed"].contains(&case) {
+            assert!(result.is_err(), "{case}: {result:?}");
+        } else {
+            assert!(result.unwrap()[0].contains("hold promote"), "{case}");
+        }
+        let published = forge.promote_ref.borrow().clone().unwrap();
+        assert_ne!(published, HEAD);
+        assert!(
+            forge
+                .checked_heads
+                .borrow()
+                .iter()
+                .all(|oid| oid == &published)
+        );
+        assert_eq!(git.prepared.len(), 1);
+        let writes = forge.writes.take();
+        assert_eq!(
+            writes.len(),
+            2,
+            "{case}: only pending receipt and diagnostic"
+        );
+        assert!(writes.iter().all(|(_, path, _)| !path.contains("/pulls")));
+        let receipt = writes.last().unwrap().2["body"].clone();
+        assert!(
+            !receipt
+                .as_str()
+                .unwrap()
+                .contains("```agent-board-promoted")
+        );
+        comments(&mut forge.replay).as_array_mut().unwrap().push(json!({
+            "id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":receipt
+        }));
+        sync_metadata(&mut forge.replay);
+        forge.publication_checks = green;
+        let lines = publish::apply_with(&forge, &config, forge.replay.now, 3, &mut git).unwrap();
+        assert!(lines[0].starts_with("promoted "), "{case}: {lines:?}");
+        assert_eq!(
+            git.prepared.len(),
+            1,
+            "{case}: receipt avoids another rebase"
+        );
+        let writes = forge.writes.borrow();
+        let receipt = writes.last().unwrap().2["body"].as_str().unwrap();
+        assert!(receipt.contains(&format!("approval of {HEAD} carried over")));
+        assert!(receipt.contains(&published));
+    }
+}
+
+#[test]
+fn retained_pending_checks_yield_to_the_next_candidate_without_writes() {
+    let (mut forge, config) = publication();
+    with_second(&mut forge);
+    body(&mut forge.replay, "/compare/")["behind_by"] = json!(1);
+    let base = body(&mut forge.replay, "composefs-rs/branches/main")["commit"]["sha"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut pending = forge.publication_checks.clone();
+    pending["contexts"]["nodes"][0]["status"] = json!("IN_PROGRESS");
+    forge
+        .checks_by_head
+        .insert(FakeRewrite::head(&base), pending);
+    let mut git = FakeRewrite::new(&forge);
+    let first = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+    assert!(first[0].contains("required checks pending"), "{first:?}");
+    let writes = forge.writes.take();
+    assert_eq!(writes.len(), 2);
+    comments(&mut forge.replay)
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,
+            "body":writes.last().unwrap().2["body"]
+        }));
+    sync_metadata(&mut forge.replay);
+    let second = publish::apply_with(&forge, &config, forge.replay.now, 3, &mut git).unwrap();
+    assert_eq!(second.len(), 2, "{second:?}");
+    assert!(second[0].contains("required checks pending"));
+    assert!(
+        second[1].starts_with(&format!("promoted {REPO}#35")),
+        "{second:?}"
+    );
+    assert_eq!(git.prepared.len(), 1);
+    let writes = forge.writes.borrow();
+    assert_eq!(writes.len(), 3);
+    assert!(writes[0].1.ends_with("/issues/35/comments"));
+}
+
+#[test]
+fn publication_checks_do_not_accept_green_checks_on_the_approved_head() {
+    let (mut forge, config) = publication();
+    body(&mut forge.replay, "/compare/")["behind_by"] = json!(1);
+    forge.publication_checks["contexts"]["nodes"][0]["conclusion"] = json!("FAILURE");
+    let mut git = FakeRewrite::new(&forge);
+    let lines = publish::apply_with(&forge, &config, forge.replay.now, 4, &mut git).unwrap();
+    assert!(lines[0].contains("required checks failed"), "{lines:?}");
+    assert!(!forge.checked_heads.borrow().contains(&HEAD.to_owned()));
+    assert!(forge.promoted.borrow().is_empty());
 }
 
 #[test]
@@ -3051,10 +3241,118 @@ fn incomplete_or_unreadable_is_never_empty_success() {
             entry["answer"]["body"]["source"]["full_name"] = json!("other/repo");
         }
     }
-    assert_eq!(
-        run(replay, &config).0.unwrap(),
-        [hold("fork-network mismatch"), REMAINING.into()]
+    assert!(
+        format!("{:#}", run(replay, &config).0.unwrap_err()).contains("disagrees with fork parent")
     );
+}
+
+#[test]
+fn promotion_targets_require_metadata_and_the_actual_parent() {
+    for (fork, origin, topics, parent, legacy, expected) in [
+        (
+            true,
+            "fork",
+            json!(["bot-midstream"]),
+            "upstream/project",
+            false,
+            "selected",
+        ),
+        (
+            true,
+            "owned",
+            json!(["bot-midstream"]),
+            "upstream/project",
+            false,
+            "skip",
+        ),
+        (true, "fork", json!([]), "upstream/project", true, "skip"),
+        (
+            true,
+            "fork",
+            json!(["bot-midstream"]),
+            "upstream/project",
+            true,
+            "selected",
+        ),
+        (true, "owned", json!([]), "other/project", true, "disagrees"),
+        (
+            false,
+            "fork",
+            json!(["bot-midstream"]),
+            "upstream/project",
+            false,
+            "GitHub fork",
+        ),
+        (
+            false,
+            "owned",
+            json!([]),
+            "upstream/project",
+            true,
+            "GitHub fork",
+        ),
+        (
+            true,
+            "fork",
+            json!(["bot-midstream"]),
+            "other/project",
+            true,
+            "disagrees",
+        ),
+    ] {
+        let metadata = json!({"full_name":"team/project", "fork":fork,
+            "custom_properties":{"origin":origin}, "topics":topics,
+            "parent":{"full_name":parent,"default_branch":"trunk"}});
+        let hint = pass::promote::Fork {
+            upstream: "upstream/project".into(),
+            base: "release".into(),
+        };
+        let result = target(&metadata, "team/project", legacy.then_some(&hint));
+        match expected {
+            "selected" => {
+                let target = result.unwrap().unwrap();
+                assert_eq!(target.upstream, parent);
+                assert_eq!(target.base, if legacy { "release" } else { "trunk" });
+            }
+            "skip" => assert!(result.unwrap().is_none()),
+            error => assert!(format!("{:#}", result.unwrap_err()).contains(error)),
+        }
+    }
+}
+
+#[test]
+fn metadata_discovery_does_not_need_static_fork_entries() {
+    for (origin, topic, fork, expected) in [
+        ("fork", true, true, "selected"),
+        ("owned", true, true, "skip"),
+        ("fork", false, true, "skip"),
+        ("fork", true, false, "error"),
+    ] {
+        let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+        value["promote"]["forks"] = json!({});
+        value["midstream"] = json!({"owner":"cgwalters-forge","topic":"bot-midstream"});
+        value["pr"] = json!({"fixPools":["claude"]});
+        let config = Config::parse(&value.to_string()).unwrap();
+        assert!(enabled(&config));
+        let mut replay = scenario();
+        let metadata = json!({"full_name":REPO,"fork":fork,
+            "custom_properties":{"origin":origin},
+            "topics":if topic {json!(["bot-midstream"])} else {json!([])},
+            "parent":{"full_name":"composefs/composefs-rs","default_branch":"trunk"}});
+        *body(&mut replay, &format!("repos/{REPO}")) = metadata.clone();
+        replay.requests.push(json!({"request":{"get":format!("{API}orgs/cgwalters-forge/repos?type=public&per_page=100")},
+            "answer":{"status":200,"link":null,"body":[metadata]}}));
+        let result = targets(&replay, &config);
+        match expected {
+            "selected" => {
+                let found = result.unwrap();
+                assert_eq!(found.len(), 1);
+                assert_eq!(found[REPO].base, "trunk");
+            }
+            "skip" => assert!(result.unwrap().is_empty()),
+            _ => assert!(format!("{:#}", result.unwrap_err()).contains("GitHub fork")),
+        }
+    }
 }
 
 #[test]

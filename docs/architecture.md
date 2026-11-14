@@ -307,17 +307,28 @@ approved work visible without granting the pass upstream write authority.
   force-push back to an old oid. Complete authenticated branch activity, not
   commit author/committer dates, proves the push. Missing, truncated, edited
   with unverifiable authorship, ambiguous or out-of-order evidence holds.
-* **Where it goes.** `promote.forks` in the configuration, never the pull
-  request's body, which anyone can edit. At run time the fork's GitHub parent
-  or network root must be the configured upstream. A fork may also be in
+* **Where it goes.** Midstream repository metadata, never the pull
+  request's body, which anyone can edit. Discovery lists the configured
+  midstream owner's public repositories within the existing five-page bound.
+  Only repositories with both `origin=fork` and `bot-midstream` are candidates;
+  their GitHub `parent` supplies the upstream and its default branch the base.
+  With promotion configured, `midstream.topic` must be `bot-midstream`, so
+  stage 2's no-merge protection covers the same metadata-only candidates.
+  A non-fork is a hard error, including an explicitly named legacy entry.
+  `promote.forks` stays readable for one release for the pinned tracker config:
+  its upstream must agree with the actual parent, and its base overrides the
+  default. It cannot bypass the metadata gate. This stops a stale static entry
+  publishing from a detached fork or into a different network. A fork may also be in
   `follow` only when `midstream` owns it; stage 2 must then verify its topic
   membership before following it with midstream's no-merge policy. Otherwise
   it refuses, so a missing topic cannot permit a merge into the fork's main.
 * **Candidate read gates.** Only after command/head evidence passes, read in
   order: all upstream PRs for the head repository owner's branch (same open
   head is already promoted; different, closed or merged holds); upstream-base
-  comparison (zero ahead holds; preview reports behind heads as needing a
-  publication rebase); the issue's accepted plan's `stacks_on`; DCO facts from required
+  comparison (zero ahead holds; a behind head whose commits form a linear
+  bot- or operator-authored chain is reported ready after a publication rebase,
+  whose conflict only `--apply` finds and holds; the awaiting queue still holds
+  it); the issue's accepted plan's `stacks_on`; DCO facts from required
   base-branch checks or base-head check runs; and unchanged title/body text.
   This prevents duplicate publication, stale bases, unmerged dependencies,
    unsafe sign-off rewrites and references changing meaning upstream. Only a
@@ -461,6 +472,17 @@ approved work visible without granting the pass upstream write authority.
   rewriting holds for manual migration, rather than creating a duplicate PR.
   The upstream base and approved head are checked again before pushing the new
   branch.
+  Before any upstream PR write, read the fork PR base's required checks from
+  rules and classic protection, and the exact publication oid's check rollup
+  from its head repository. App-bound requirements cannot be satisfied by
+  another app or a plain status. Paginate the full rollup; missing, pending or
+  failed required checks hold publication, and malformed or incomplete evidence
+  is an error. A null rollup holds even on an unprotected base. A retained
+  pending receipt lets later invocations wait for checks without replaying the
+  approved head again. Success records approval carryover from the approved oid
+  to the checked publication oid; the original approval is still revalidated
+  on each retry. This gate does not itself arrange CI for a new publication ref;
+  a fork whose workflows do not check that ref remains held.
   Draft creation is deliberate:
   GitHub's branch-based POST can race a push, so it must not mark an unapproved
   head ready. Verify the branch immediately before publication and verify the
