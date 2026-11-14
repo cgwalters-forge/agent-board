@@ -32,6 +32,7 @@ pub mod lock;
 pub mod notify;
 mod operator_keys;
 pub mod pace;
+mod recovery;
 pub mod report;
 mod reviews;
 pub mod stale;
@@ -301,7 +302,16 @@ pub(crate) const FIX_PLANS_HELD: &str =
 /// stays the operator's: it needs a maintainer's permissions there, or is
 /// theirs to decide.
 pub(crate) const AUTHORED_STEPS: &[&str] = &[
-    "fix", "continue", "rebase", "answer", RUN_RERUN, "refund", "update", "retitle",
+    "triage",
+    "triage-grant",
+    "fix",
+    "continue",
+    "rebase",
+    "answer",
+    RUN_RERUN,
+    "refund",
+    "update",
+    "retitle",
 ];
 
 /// agentic-job's apply pushes a round's commit to a head repository other
@@ -561,6 +571,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "operatorPaths",
     "staleDays",
     "holdDependencies",
+    "agentRecovery",
     "holdMissingData",
 ];
 
@@ -625,6 +636,9 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
+    /// Avoid parking mechanical queue failures and exhausted work on the operator.
+    /// Off by default; two triages and one bounded round grant per PR.
+    pub agent_recovery: bool,
     /// Prevent recovery/review work on a PR with unmet body dependencies.
     /// Off by default, bounded to ten distinct dependencies per PR.
     pub hold_dependencies: bool,
@@ -1063,6 +1077,8 @@ pub const OPERATOR_PATHS_LIMIT: usize = 50;
 #[serde(rename_all = "camelCase")]
 pub struct PrOptions {
     #[serde(default)]
+    pub agent_recovery: bool,
+    #[serde(default)]
     pub queue_only_repository: Option<String>,
     #[serde(default)]
     pub hold_missing_data: bool,
@@ -1209,6 +1225,7 @@ impl PrOptions {
     /// Sets these in `policy`.
     pub fn apply(&self, policy: &mut PollPolicy) {
         let Self {
+            agent_recovery,
             queue_only_repository,
             hold_missing_data,
             hold_dependencies,
@@ -1229,6 +1246,7 @@ impl PrOptions {
             stale_days,
         } = self.clone();
         policy.queue_only_repository = queue_only_repository;
+        policy.agent_recovery = agent_recovery;
         policy.hold_dependencies = hold_dependencies;
         policy.hold_missing_data = hold_missing_data;
         policy.action_first = action_first;
@@ -1373,6 +1391,7 @@ impl PollPolicy {
             own_space_only: false,
             action_first: false,
             hold_dependencies: false,
+            agent_recovery: false,
             fold_rounds: false,
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
@@ -2687,6 +2706,8 @@ fn newest_verdict<'a>(
 /// The poll's round count, from its marker comment on the pull request.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Marker {
+    /// A bounded triage reservation, retained through subsequent repair rounds.
+    pub recovery: Option<recovery::Recovery>,
     pub id: Option<u64>,
     pub rounds: u64,
     pub sha: Option<String>,
@@ -2845,6 +2866,9 @@ impl Marker {
     /// The state the marker comment carries, as poll.cjs writes it.
     fn state(&self) -> Value {
         let mut state = json!({"rounds": self.rounds});
+        if let Some(recovery) = &self.recovery {
+            state["recovery"] = json!(recovery);
+        }
         if let Some(sha) = &self.sha {
             state["sha"] = sha.as_str().into();
         }
@@ -3007,6 +3031,7 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
             continue;
         }
         let marker = Marker {
+            recovery: state.get("recovery").map(recovery::read),
             id: comment["id"].as_u64(),
             rounds,
             sha: state["sha"].as_str().map(str::to_owned),
@@ -3686,7 +3711,12 @@ pub fn fix_task(
     let mut lines = vec![format!(
         "Pull request {repo}#{number} at head {head} cannot merge as it is. Make the smallest change to its branch that addresses what follows, and nothing else. {which}"
     )];
-    if pull["mergeable"] == CONFLICTING {
+    if pull["mergeable"] == CONFLICTING
+        || checks
+            .failed
+            .iter()
+            .any(|(name, _)| name == recovery::QUEUE_CONFLICT)
+    {
         lines.extend([String::new(), conflict_text(base)]);
     }
     if !checks.failed.is_empty() || review.is_some() {
@@ -3795,7 +3825,9 @@ fn unreviewed(reason: impl Into<String>) -> Decision {
 fn step_kind(action: &str) -> Option<Kind> {
     match action {
         "skip" | "wait" => None,
-        "fix" | "continue" | "rebase" | "answer" | RUN_RERUN | REVIEW => Some(Kind::Dispatch),
+        "fix" | "continue" | "rebase" | "answer" | "triage" | RUN_RERUN | REVIEW => {
+            Some(Kind::Dispatch)
+        }
         // merge, update, refund, needs-human, retitle and a review rerun.
         _ => Some(Kind::Write),
     }
@@ -3882,10 +3914,11 @@ pub fn queue_step(
         }
         // Before a fix too: a person's removal is not answered by a fix round,
         // which would leave the removal seen and so the queue to the poll.
-        ("merge" | "fix" | "rebase" | "continue", Removal::Stop(why)) => {
-            stop(format!("{why}, which the poll does not retry"), state)
-        }
-        ("fix" | "rebase" | "needs-human", _) => Decision {
+        (
+            "merge" | "fix" | "rebase" | "continue" | "triage" | "triage-grant",
+            Removal::Stop(why),
+        ) => stop(format!("{why}, which the poll does not retry"), state),
+        ("fix" | "rebase" | "needs-human" | "triage", _) => Decision {
             queue: Some(state),
             ..decision
         },
@@ -4147,7 +4180,10 @@ pub fn decide(
                     queue: None,
                     waiting: WaitReason::Person,
                 };
-                let refits = config.policy.unstall && rounds > 0 && marker.continued <= rounds;
+                let refits = !config.policy.agent_recovery
+                    && config.policy.unstall
+                    && rounds > 0
+                    && marker.continued <= rounds;
                 if marker.sha.as_deref() == Some(head) {
                     let decision = started(config, marker, (fix_run, outages), head, &why, now);
                     if refits && marker.continuing && decision.action == "needs-human" {
@@ -4162,8 +4198,8 @@ pub fn decide(
                     ));
                 }
                 if marker.continued >= rounds {
-                    return step(
-                        "needs-human",
+                    return recovery::exhausted(
+                        config,
                         format!(
                             "{} of {rounds} continuation rounds used and {} is still a draft ({why})",
                             marker.continued,
@@ -4234,8 +4270,8 @@ pub fn decide(
         };
         if conflict_only && rebases > 0 {
             if marker.rebased >= rebases {
-                return step(
-                    "needs-human",
+                return recovery::exhausted(
+                    config,
                     format!(
                         "{rebases} rebase rounds used and {} still conflicts with {base}",
                         short(head)
@@ -4254,7 +4290,7 @@ pub fn decide(
         // The diagnostic round is one more, counted in `rounds` as the next
         // fix round, so it is claimed and recorded like one and runs once.
         let pool = &config.policy.diagnostic_pool;
-        if marker.rounds == MAX_FIX_ROUNDS && !pool.is_empty() {
+        if !config.policy.agent_recovery && marker.rounds == MAX_FIX_ROUNDS && !pool.is_empty() {
             return Decision {
                 action: "fix",
                 reason: format!(
@@ -4271,8 +4307,8 @@ pub fn decide(
             } else {
                 format!("{} fix rounds", marker.rounds)
             };
-            return step(
-                "needs-human",
+            return recovery::exhausted(
+                config,
                 format!("{used} used and {} still fails ({why})", short(head)),
             );
         }
@@ -5832,6 +5868,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         self.dispatched += 1;
         let superseded = marker;
         let mut marker = Marker {
+            recovery: carried.recovery.clone(),
             id: None,
             rounds: if continuing || rebasing {
                 carried.rounds
@@ -6079,6 +6116,39 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 let excerpt = checks.diagnosis.as_deref();
                 self.needs_human(repo, pull, marker, &decision.reason, excerpt)?;
                 Ok(Some(self.human_wait(repo, pull)))
+            }
+            "triage" => self
+                .start_triage(repo, pull, (marker, read), &decision.reason)
+                .map(Some),
+            "triage-grant" => {
+                let (owner, name) = repo.split_once('/').context("triage grant repository")?;
+                let current = self.read_pull(owner, name, number)?;
+                if current["headRefOid"] != pull["headRefOid"]
+                    || !truncated(&current).is_empty()
+                    || labelled(&current)
+                    || is_held(&current)
+                    || review_hold(self.config, &current).is_some()
+                {
+                    return Ok(Some("not granted: head changed or held".into()));
+                }
+                let state = json!({"from": claim_from(marker), "triage_grant": head});
+                let claim = match self.claim(
+                    repo,
+                    number,
+                    marker,
+                    read,
+                    (state, "Bounded agent triage grant"),
+                )? {
+                    Ok(claim) => claim,
+                    Err((id, _)) => {
+                        return Ok(Some(format!(
+                            "not granted: already claimed in comment {id}"
+                        )));
+                    }
+                };
+                let mut next = recovery::granted(marker);
+                self.mark_claim(repo, claim, &mut next, &decision.reason, (marker, read))?;
+                Ok(Some("one bounded set of repair rounds granted".into()))
             }
             // The bot's own pull request, so its token may edit it. Not pinned
             // to the head, which an edit cannot be: a push after the read
@@ -7231,6 +7301,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let since = state.since.replace(plain(removed_at));
         let removal = match text(latest, "/reason") {
             "merged" => Removal::None,
+            "merge_conflict" if self.config.policy.agent_recovery => {
+                state.failed = Some(recovery::QUEUE_CONFLICT.into());
+                Removal::None
+            }
             "merge_conflict" => Removal::Retry("a merge conflict".into()),
             "stack_invalidated" => Removal::Retry("the queue rebuilt around it".into()),
             "failed_checks" | "checks_timed_out" => {
@@ -8303,7 +8377,17 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             }
         };
         let mut decision = match (tries, removal) {
-            (Some(tries), Some((removal, state))) => queue_step(decision, removal, state, tries),
+            (Some(tries), Some((removal, state))) => {
+                let exhausted = self.config.policy.agent_recovery
+                    && decision.action == "merge"
+                    && matches!(removal, Removal::Retry(_))
+                    && state.tries >= tries;
+                let mut decision = queue_step(decision, removal, state, tries);
+                if exhausted {
+                    decision.action = "triage";
+                }
+                decision
+            }
             _ => decision,
         };
         if decision.action == "merge" && queue_only(&self.config.policy, repo) && !queued {
@@ -8315,15 +8399,22 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // A conflict can wait for an earlier change to land. An approved,
         // clean head must be enqueued now: GitHub owns queue ordering and
         // merge-group revalidation, not a file-overlap guess by this pass.
-        let rebase =
-            matches!(decision.action, "fix" | "rebase") && pull["mergeable"] == CONFLICTING;
+        let rebase = matches!(decision.action, "fix" | "rebase")
+            && (pull["mergeable"] == CONFLICTING
+                || checks
+                    .failed
+                    .iter()
+                    .any(|(name, _)| name == recovery::QUEUE_CONFLICT));
         if tries.is_some()
-            && rebase
+            && (rebase || (self.config.policy.agent_recovery && decision.action == "merge"))
             && let Some(ahead) = self.ahead(repo, &pull)?
         {
             decision = step(
                 "wait",
-                format!("{ahead}{AHEAD_IN_QUEUE}{} after it", "rebased"),
+                format!(
+                    "{ahead}{AHEAD_IN_QUEUE}{} after it",
+                    if rebase { "rebased" } else { "queued" }
+                ),
             )
             .followed(None);
         }
@@ -8381,21 +8472,25 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // a stack operation, an operator answer, or an in-flight round.
         let retry_scope = (self.config.policy.reruns || self.config.policy.check_reruns)
             && !missing_data
+            && !recovery::pending(&marker)
             && !merge_only
             && !stack_step
             && !queue_stop
             && answer.is_empty()
             && !labelled(&pull)
             && is_harness(&pull, self.config);
-        let retry_wait =
-            if retry_scope && matches!(decision.action, "fix" | "needs-human" | "merge" | "wait") {
-                self.check_retry_wait(repo, head, &comments, &checks)?
-            } else {
-                None
-            };
+        let retry_wait = if retry_scope
+            && matches!(
+                decision.action,
+                "fix" | "needs-human" | "triage" | "merge" | "wait"
+            ) {
+            self.check_retry_wait(repo, head, &comments, &checks)?
+        } else {
+            None
+        };
         let check_reruns = if retry_scope
             && retry_wait.is_none()
-            && matches!(decision.action, "fix" | "needs-human")
+            && matches!(decision.action, "fix" | "needs-human" | "triage")
         {
             self.check_reruns(repo, &pull, &checks, &comments)?
         } else {
@@ -8425,13 +8520,22 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 )
             };
         }
-        // Every round here is dispatched as the `fix` kind, so one outside
-        // the caller's fix bounds would only be refused by its policy step
-        // (agent-board#264). Nothing is written; the operator takes it.
+        if self.config.policy.agent_recovery
+            && !missing_data
+            && !queue_stop
+            && is_harness(&pull, self.config)
+            && !labelled(&pull)
+            && !is_held(&pull)
+            && review_hold(self.config, &pull).is_none()
+        {
+            decision = self.recovery_step(repo, &pull, &marker, &comments, decision)?;
+        }
+        // Repairs and their triage share the fix scope checks here. The caller
+        // independently checks each dispatched kind against its own bounds.
         let bounds = &self.config.policy.fix_bounds;
         let round = matches!(
             decision.action,
-            "fix" | "continue" | "rebase" | "answer" | RUN_RERUN
+            "fix" | "continue" | "rebase" | "answer" | "triage" | "triage-grant" | RUN_RERUN
         );
         let mut left = round
             .then(|| {
@@ -8624,6 +8728,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 &decision,
                 review_run.as_ref(),
             ),
+            (None, None, None) if decision.action == "triage" => self
+                .start_triage(repo, &pull, (&marker, &comments), &decision.reason)
+                .map(Some),
             (None, None, None)
                 if self.config.policy.preview_fix_pools.is_some()
                     && matches!(decision.action, "fix" | "continue" | "rebase") =>
@@ -9790,6 +9897,7 @@ mod tests {
     include!("poll/drafts_tests.rs");
     include!("poll/dependencies_tests.rs");
     include!("poll/report_tests.rs");
+    include!("poll/recovery_tests.rs");
 
     /// A marker as a pass with the default attribution posts it.
     pub(super) fn marker_body(state: &Value, text: &str) -> String {
