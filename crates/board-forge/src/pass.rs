@@ -1046,6 +1046,9 @@ pub struct PoolSettings {
     /// computes the snapshot's hold reads it.
     #[serde(default)]
     pub burst: f64,
+    /// Full provider resets banked by the operator, not automatic resets.
+    #[serde(default)]
+    pub resets: Vec<resets::Reset>,
 }
 
 fn default_target() -> f64 {
@@ -1487,6 +1490,7 @@ impl Config {
                 (0.0..=BURST_LIMIT).contains(&settings.burst),
                 "pools.{name}.burst is not 0 to {BURST_LIMIT}"
             );
+            resets::check(&settings.resets).with_context(|| format!("pools.{name}.resets"))?;
         }
         mix::validate(self)?;
         for (what, list) in [
@@ -5304,7 +5308,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         }
-        let mut fresh = self.snapshot.clone().flatten();
+        // The poll paces by banked resets only through the adjusted snapshot.
+        let banked = config.pools.0.iter().any(|(_, p)| !p.resets.is_empty());
+        let mut fresh = if banked {
+            self.snapshot()
+        } else {
+            self.snapshot.clone().flatten()
+        };
         if let Some(why) = self.budget_hold(1.0 + FOLLOW_MARGIN) {
             self.line(format!("budget: {why}; pull requests' fix rounds wait"));
             let held = json!({"hold": true, "reason": "budget", "next_dispatch_at": null});
@@ -6432,11 +6442,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             };
             self.snapshot = Some(read);
         }
-        let snapshot = self
-            .snapshot
-            .clone()
-            .flatten()
-            .map(|s| self.config.pace.apply(s, self.now));
+        let snapshot = self.snapshot.clone().flatten().map(|s| {
+            let first = s["pace_adjusted"] != true;
+            let adjusted = resets::apply(self.config, s, self.now);
+            if first {
+                for line in resets::lines(self.config, &adjusted, self.now) {
+                    self.line(line);
+                }
+            }
+            adjusted
+        });
         self.snapshot = Some(snapshot.clone());
         snapshot
     }
@@ -9709,6 +9724,7 @@ pub mod mix;
 pub mod needs;
 pub mod next;
 pub mod promote;
+mod resets;
 pub mod revisit;
 mod routing;
 pub mod sessions;
