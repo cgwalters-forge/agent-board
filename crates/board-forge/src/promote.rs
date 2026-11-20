@@ -16,6 +16,9 @@ const API: &str = "https://api.github.com/";
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
 
+/// First line of a diagnostic comment, never a publication receipt.
+const HOLD_COMMENT: &str = "<!-- agent-board-promote-hold: ";
+
 /// An unreadable response, distinct from a well-read fact holding promotion.
 #[derive(Debug)]
 pub(crate) struct ReadFailure(String);
@@ -38,6 +41,25 @@ impl std::fmt::Display for Held {
 }
 
 impl std::error::Error for Held {}
+
+/// Whether `error` says the promotion holds on a well-read fact, rather than
+/// failing to read one or waiting for a publication that would go ahead.
+pub(crate) fn holds(error: &anyhow::Error) -> bool {
+    error.is::<Held>()
+}
+
+/// What only publication's --apply does yet, a rebase, a sign-off or
+/// unverified bot-fork staging: not a hold ([`holds`]).
+#[derive(Debug)]
+struct Unpublished(String);
+
+impl std::fmt::Display for Unpublished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unpublished {}
 
 #[derive(Debug)]
 pub(crate) struct NotSelected(String);
