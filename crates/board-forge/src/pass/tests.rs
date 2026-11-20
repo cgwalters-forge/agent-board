@@ -5676,6 +5676,7 @@ fn own() -> PassRun {
     PassRun {
         repository: "cgwalters-forge/tracker".into(),
         id: 4242,
+        attempt: 1,
     }
 }
 
@@ -5834,6 +5835,17 @@ impl Forge {
             .filter(|b| b.starts_with(holds::PART_MARKER))
             .collect();
         holds::assemble(first, &parts)
+    }
+
+    /// The pass history the last write of its comment published
+    /// ([`history::published`]).
+    pub(super) fn published_passes(&self) -> Option<Value> {
+        let writes = self.writes.borrow();
+        let bodies = writes.iter().filter(|(method, ..)| method != "GET");
+        let body = bodies
+            .map(|(.., body)| text(body, "/body"))
+            .rfind(|b| b.starts_with(history::MARKER))?;
+        history::published(body)
     }
 
     /// The actual emitted holds comment, not a reconstruction from the report.
@@ -7026,6 +7038,170 @@ fn apply_publishes_the_pass_view() {
             ),
         }
     }
+}
+
+/// With `holds.passes`, an applying pass publishes the pass history as the
+/// bot's own comment on the holds issue, one the reader takes, with this
+/// pass's run, its confirmed starts and every stage's outcome, even where
+/// the hold snapshot's write was refused, which its holds section then says.
+/// Off, there is none.
+#[test]
+fn passes_are_published_apart_from_the_holds() {
+    for (passes, refuse_holds) in [(true, false), (true, true), (false, false)] {
+        let mut forge = Forge::new(None, false);
+        let at = forge.holds_destination(true);
+        let mut settings = json!({"wip": 8, "holds": at});
+        settings["holds"]["passes"] = passes.into();
+        if refuse_holds {
+            // The holds issue has no hold snapshot yet, so its write is the
+            // first comment posted there; the history's comes after it.
+            let holds = format!("POST {API_ROOT}repos/cgwalters-forge/bot-ops/issues/1/comments");
+            *forge.refuse.borrow_mut() = Some(holds);
+        }
+        let config = config(settings);
+        let report = apply(&forge, &config);
+        let case = format!("passes {passes}, holds refused {refuse_holds}");
+        assert_eq!(forge.published_holds().is_some(), !refuse_holds, "{case}");
+        let Some(published) = forge.published_passes() else {
+            assert!(!passes, "{case}: {:#?}", report.lines);
+            assert!(report.passes.is_none(), "{case}");
+            assert!(
+                !report.lines.iter().any(|l| l.starts_with("passes")),
+                "{case}"
+            );
+            continue;
+        };
+        assert!(
+            history::tests::accepted(&published),
+            "{case}: {published:#}"
+        );
+        assert_eq!(report.passes.as_ref(), Some(&published), "{case}");
+        let said = report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("passes: published https://"));
+        assert!(said, "{case}: {:#?}", report.lines);
+        assert_eq!(published["omitted"], 0, "{case}");
+        let pass = &published["passes"][0];
+        assert_eq!(
+            pass["run"],
+            json!({"repository": "cgwalters-forge/tracker", "id": 4242, "attempt": 1})
+        );
+        assert_eq!(pass["mode"], "actions");
+        let starts = pass["starts"].as_array().unwrap();
+        assert_eq!(starts.len(), report.tally.1.started, "{case}: {pass}");
+        assert!(!starts.is_empty(), "{case}");
+        assert!(
+            starts
+                .iter()
+                .all(|s| s["state"] == "confirmed" && s["run"]["id"].as_u64() > Some(0)),
+            "{case}: {pass}"
+        );
+        let sections: BTreeMap<&str, &Value> = (pass["sections"].as_array().unwrap().iter())
+            .map(|s| (s["name"].as_str().unwrap(), &s["outcome"]))
+            .collect();
+        assert_eq!(sections.len(), Stage::ALL.len(), "{case}");
+        assert_eq!(sections["schedule"], "ok", "{case}: {pass}");
+        match refuse_holds {
+            true => {
+                assert_eq!(
+                    (&pass["result"], sections["holds"]),
+                    (&json!("partial"), &json!("failed"))
+                );
+                let error = pass["sections"][8]["error"].as_str().unwrap();
+                assert!(
+                    error.starts_with("holds error: ") && !error.contains("://"),
+                    "{error}"
+                );
+            }
+            false => {
+                assert_eq!(
+                    (&pass["result"], sections["holds"]),
+                    (&json!("success"), &json!("ok"))
+                );
+            }
+        }
+        assert_eq!(
+            pass["candidates"]["read"],
+            report.tally.1.candidates.unwrap()
+        );
+        assert_eq!(published["pools"]["complete"], true, "{case}");
+        assert_eq!(published["in_flight"]["complete"], true, "{case}");
+        // Nothing from a hold's reason, and no address.
+        let text = published.to_string();
+        assert!(!text.contains('$') && !text.contains("://"), "{text}");
+    }
+}
+
+/// A pass whose setup failed publishes a `failure` record with every later
+/// section skipped; a preview writes nothing, says what it would, and its
+/// starts are previews.
+#[test]
+fn passes_record_a_failed_setup_and_a_preview() {
+    let mut forge = Forge::new(None, false);
+    let at = forge.holds_destination(true);
+    let mut settings = json!({"wip": 8, "holds": at});
+    settings["holds"]["passes"] = true.into();
+    let mut cfg = config(settings);
+    cfg.dispatch_ref = None;
+    forge.on_get = Some(Box::new(|url, body| {
+        if url.ends_with("/repos/cgwalters-forge/tracker") {
+            body["default_branch"] = Value::Null;
+        }
+    }));
+    let report = apply(&forge, &cfg);
+    let published = forge
+        .published_passes()
+        .unwrap_or_else(|| panic!("{:#?}", report.lines));
+    assert!(history::tests::accepted(&published), "{published:#}");
+    let pass = &published["passes"][0];
+    assert_eq!(pass["result"], "failure", "{pass}");
+    assert_eq!(pass["sections"][0]["outcome"], "failed");
+    assert!(
+        pass["sections"][0]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("dispatch ref error: "),
+        "{pass}"
+    );
+    assert!(
+        pass["sections"].as_array().unwrap()[1..]
+            .iter()
+            .all(|s| s["outcome"] == "skipped"),
+        "{pass}"
+    );
+    assert_eq!(
+        (&pass["starts"], &pass["candidates"]),
+        (&json!([]), &Value::Null)
+    );
+    let mut forge = Forge::new(None, false);
+    let at = forge.holds_destination(true);
+    let mut settings = json!({"wip": 8, "holds": at});
+    settings["holds"]["passes"] = true.into();
+    let report = preview(&config(settings), &forge.replay);
+    let said = "passes: publish to cgwalters-forge/bot-ops#1; a preview does not write it";
+    assert!(
+        report.lines.iter().any(|l| l == said),
+        "{:#?}",
+        report.lines
+    );
+    let document = report.passes.as_ref().unwrap();
+    assert!(history::tests::accepted(document), "{document:#}");
+    let pass = &document["passes"][0];
+    assert_eq!(
+        (&pass["run"], &pass["mode"]),
+        (&Value::Null, &json!("preview"))
+    );
+    let starts = pass["starts"].as_array().unwrap();
+    assert!(!starts.is_empty(), "{pass}");
+    assert!(
+        starts
+            .iter()
+            .all(|s| s["state"] == "preview" && s["run"].is_null()),
+        "{pass}"
+    );
+    let planned: u64 = report.planned_starts.values().sum();
+    assert_eq!(starts.len() as u64, planned, "{pass}");
 }
 
 #[test]
