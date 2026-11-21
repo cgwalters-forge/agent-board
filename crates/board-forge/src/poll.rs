@@ -1987,6 +1987,11 @@ pub struct State {
     pub changes_swept: Option<String>,
     /// Scoped cross-pass full-walk coverage; trusted like changes_swept.
     pub changes_sweep: Option<crate::pass::changed::Sweep>,
+    /// The pass's `publicState` ([`crate::pass::public`]): the lower-case
+    /// repositories GitHub said were public when it ended, to their node
+    /// ids, which bind what the next pass keeps of each. A pass without the
+    /// option drops them; losing them keeps nothing for one pass.
+    pub public_repositories: BTreeMap<String, String>,
     /// The changes diff's watermarks, which the caller reads from the store
     /// and never from this file: not serialized.
     pub changes: Option<crate::changes::diff::State>,
@@ -2045,6 +2050,7 @@ impl State {
                     "authored_cursor",
                     "changes_swept",
                     "changes_sweep",
+                    "public_repositories",
                     // Read no more: the pass reads the live epics itself.
                     "authored_priority"
                 ]
@@ -2270,6 +2276,21 @@ impl State {
         let maintain = (object.get("maintain"))
             .map(crate::pass::maintain::Day::from_json)
             .transpose()?;
+        let public_repositories: BTreeMap<String, String> = object
+            .get("public_repositories")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .context("poll state public_repositories is not a repository-to-id map")?
+            .unwrap_or_default();
+        ensure!(
+            public_repositories.len() <= crate::pass::public::REPOSITORIES
+                && public_repositories.iter().all(|(repo, id)| {
+                    validate_repository(repo).is_ok()
+                        && repo == &repo.to_ascii_lowercase()
+                        && crate::pass::public::valid_id(id)
+                }),
+            "poll state public_repositories is too large or contains an invalid repository or id"
+        );
         Ok(Self {
             response_scope: object
                 .get("response_scope")
@@ -2306,6 +2327,7 @@ impl State {
             changes_sweep: object
                 .get("changes_sweep")
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            public_repositories,
             changes: None,
         })
     }
@@ -2393,6 +2415,9 @@ impl State {
         }
         if let Some(sweep) = &self.changes_sweep {
             state["changes_sweep"] = json!(sweep);
+        }
+        if !self.public_repositories.is_empty() {
+            state["public_repositories"] = json!(self.public_repositories);
         }
         state
     }
@@ -10776,6 +10801,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         authored_cursor: None,
         changes_swept: None,
         changes_sweep: None,
+        public_repositories: BTreeMap::new(),
         changes: None,
     };
     Ok(outcome)
