@@ -256,6 +256,8 @@ fn pass_assignment(
     })
 }
 
+type Standing = Result<Option<(Assignment, Vec<plan::Comment>)>, Hold>;
+
 impl<C: Rest + Transport> Scheduler<'_, C> {
     /// [`Self::consider`], first held on or released from the operator's
     /// wait where [`Config::assign_holds`] is set. A write that fails is the
@@ -274,7 +276,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let (note, unlabelled) =
             match (self.config.assign_holds || self.config.operator_questions_only) && facts.open {
                 false => (None, false),
-                true => match self.operator_wait(facts)? {
+                true => match self.operator_wait(facts, true)? {
                     Waited::Held(held) => return Ok(Step::Hold(held)),
                     Waited::Go(note) => (note, false),
                     Waited::Unlabelled(note) => (Some(note), true),
@@ -334,7 +336,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// moves to an assignment, or the bot's assignment standing with no
     /// response since. A response takes the assignment off, one write under
     /// `--max-writes`, and the issue goes on.
-    fn operator_wait(&self, facts: &Facts) -> Result<Waited> {
+    fn operator_wait(&self, facts: &Facts, look_ahead: bool) -> Result<Waited> {
         let config = self.config;
         let operator = config.operator.as_str();
         let issue = &facts.issue;
@@ -375,8 +377,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         {
             return Ok(Waited::Go(None));
         }
-        let (assigned, comments) = match self.standing(issue) {
+        let (standing, rest) = self.standing(issue, look_ahead);
+        let (assigned, comments) = match standing {
             Ok(Some(standing)) => standing,
+            Ok(None) if self.apply && rest => return self.operator_wait(facts, false),
             Ok(None) => return Ok(Waited::Go(None)),
             Err(held) => return Ok(Waited::Held(held)),
         };
@@ -385,9 +389,15 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             && !pass_assignment(&comments, &assigned, &config.bot, operator)
         {
             // Same bot account is not proof that this pass owns the wait.
+            if self.apply && rest {
+                return self.operator_wait(facts, false);
+            }
             return Ok(Waited::Go(None));
         }
         if config.operator_questions_only && !self.explicit_operator_question(issue, &comments)? {
+            if self.apply && rest {
+                return self.operator_wait(facts, false);
+            }
             return self.release_harness(
                 issue,
                 format!("bot assignment since {since} has no concrete operator question"),
@@ -396,11 +406,19 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         }
         let Some(response) = response(&assigned, &comments, (operator, &self.writers())) else {
             if self.releasable(facts, &comments) {
+                if self.apply && rest {
+                    return self.operator_wait(facts, false);
+                }
                 let why = format!("assigned to {operator} since {since}");
                 return self.release_harness(issue, why, Release::Assignment);
             }
             return Ok(Waited::Held(waiting(operator, &since)));
         };
+        // The two REST endpoints are not an atomic snapshot. Never unassign
+        // a newly assigned operator on the strength of a look-ahead response.
+        if self.apply && rest {
+            return self.operator_wait(facts, false);
+        }
         let said = response.said(operator);
         if let Some(held) = self.caps.check(Kind::Write) {
             let why = format!("{said}; {held}: unassign {operator}");
@@ -486,20 +504,36 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
 
     /// The bot's standing assignment of the operator on `issue`, with the
     /// issue's comments, or a hold where either could not be read.
-    fn standing(&self, issue: &ItemRef) -> Result<Option<(Assignment, Vec<plan::Comment>)>, Hold> {
-        let config = self.config;
-        let read = self
-            .issue_read(issue, WAIT_QUERY)
-            .and_then(|node| assignment(&node, &config.operator, &config.bot));
+    fn standing(&self, issue: &ItemRef, look_ahead: bool) -> (Standing, bool) {
+        let (read, rest) = self.wait_assignment(issue, look_ahead);
         let assigned = match read {
             Ok(Some(assigned)) if assigned.standing => assigned,
-            Ok(_) => return Ok(None),
-            Err(error) => return Err(unreadable(error)),
+            Ok(_) => return (Ok(None), rest),
+            Err(error) => return (Err(unreadable(error)), rest),
         };
         match plan::issue_comments(&self.client, issue) {
-            Ok(comments) => Ok(Some((assigned, comments))),
-            Err(error) => Err(unreadable(error)),
+            Ok(comments) => (Ok(Some((assigned, comments))), rest),
+            Err(error) => (Err(unreadable(error)), rest),
         }
+    }
+
+    fn wait_assignment(
+        &self,
+        issue: &ItemRef,
+        look_ahead: bool,
+    ) -> (Result<Option<Assignment>>, bool) {
+        let Config { operator, bot, .. } = self.config;
+        if look_ahead
+            && let Some(assigned) =
+                self.schedule_rest("assignments", |read| read.assignment(issue, operator, bot))
+        {
+            return (Ok(assigned), true);
+        }
+        (
+            self.issue_read(issue, WAIT_QUERY)
+                .and_then(|node| assignment(&node, operator, bot)),
+            false,
+        )
     }
 
     /// Whether `facts`, an issue the pass would start work on other than
@@ -512,7 +546,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             return None;
         }
         let operator = self.config.operator.as_str();
-        let (assigned, comments) = match self.standing(&facts.issue) {
+        let (assigned, comments) = match self.standing(&facts.issue, true).0 {
             Ok(standing) => standing?,
             Err(held) => return Some(held),
         };
@@ -627,10 +661,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         issue: &ItemRef,
         verdict: &plan::Comment,
         comments: &'c [plan::Comment],
+        look_ahead: bool,
     ) -> Result<Option<Response<'c>>> {
         let config = self.config;
-        let node = self.issue_read(issue, WAIT_QUERY)?;
-        let Some(assigned) = assignment(&node, &config.operator, &config.bot)? else {
+        let Some(assigned) = self.wait_assignment(issue, look_ahead).0? else {
             return Ok(None);
         };
         if assigned.since < verdict.changed {
