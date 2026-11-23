@@ -37,6 +37,7 @@ pub mod pace;
 mod publication;
 pub mod quiet;
 mod recovery;
+mod recurring_blockers;
 pub mod report;
 mod reviews;
 pub mod stale;
@@ -614,6 +615,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "agentRecovery",
     "holdMissingData",
     "fixRounds",
+    "holdRecurringBlockers",
 ];
 
 /// `key` of a config object, refused unless `table` lists it.
@@ -763,6 +765,8 @@ pub struct PollPolicy {
     /// [`FIX_ROUNDS_LIMIT`]; none is [`FIX_ROUNDS`]. Read with
     /// [`Self::fix_rounds`].
     pub fix_rounds: Option<u64>,
+    /// Pause automatic fixes for a repeated PR metadata blocker.
+    pub hold_recurring_blockers: bool,
     /// `operatorComments.repositories`: where the operator's comments start
     /// runs ([`comments`]), as `OWNER/*` or `OWNER/REPO`. Empty (the default)
     /// reads none.
@@ -1226,6 +1230,8 @@ pub struct PrOptions {
     pub stale_days: u64,
     #[serde(default)]
     pub fix_rounds: Option<u64>,
+    #[serde(default)]
+    pub hold_recurring_blockers: bool,
 }
 
 fn maintainer_names<'de, D: serde::Deserializer<'de>>(
@@ -1398,6 +1404,7 @@ impl PrOptions {
             operator_paths,
             stale_days,
             fix_rounds,
+            hold_recurring_blockers,
         } = self.clone();
         policy.maintainers = maintainers
             .into_iter()
@@ -1426,6 +1433,7 @@ impl PrOptions {
         policy.operator_paths = operator_paths;
         policy.stale_days = stale_days;
         policy.fix_rounds = fix_rounds;
+        policy.hold_recurring_blockers = hold_recurring_blockers;
     }
 }
 
@@ -1584,6 +1592,7 @@ impl PollPolicy {
             operator_paths: Vec::new(),
             stale_days: 0,
             fix_rounds: None,
+            hold_recurring_blockers: false,
             check_reruns: false,
             unstall: false,
             hold_missing_data: false,
@@ -5477,6 +5486,9 @@ fn operator_wait(config: &Config, pull: &Value, decision: &Decision) -> Option<&
         }
         "wait" if decision.reason == PROMOTE_WAIT => Some("promote"),
         "wait" if decision.reason == UNTESTED_WAIT => Some("untested"),
+        "wait" if decision.reason.starts_with(recurring_blockers::WAIT_PREFIX) => {
+            Some("needs-human")
+        }
         _ => None,
     }
 }
@@ -9548,6 +9560,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         let queue_stop = removal
             .as_ref()
             .is_some_and(|(removal, _)| matches!(removal, Removal::Stop(_)));
+        let queue_repair = !matches!(&removal, None | Some((Removal::None, _)));
         // Not for a labelled pull request or a stop, which do not read it: an
         // unreadable run must not keep a person from taking the label off.
         let fix_run = match marker.run {
@@ -9869,6 +9882,19 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         if let Some(why) = &left {
             answer.clear();
             decision = step("skip", format!("{LEFT_TO_OPERATOR}{why}"));
+        }
+        if self.config.policy.hold_recurring_blockers
+            && decision.action == "fix"
+            && checks.failed.is_empty()
+            && pull["mergeable"] == "MERGEABLE"
+            && pull["mergeStateStatus"] != "DIRTY"
+            && !placeholder_commits(&pull)
+            && !queue_repair
+            && !promoted
+            && self.config.held_in(repo).is_none()
+            && let Some(reason) = self.recurring_blocker(repo, &pull, &marker, review_run.as_ref())
+        {
+            decision = step("wait", reason);
         }
         if decision.action == "update"
             && self
@@ -11627,6 +11653,7 @@ mod tests {
     include!("poll/dependencies_tests.rs");
     include!("poll/report_tests.rs");
     include!("poll/recovery_tests.rs");
+    include!("poll/recurring_blockers_tests.rs");
     include!("poll/publication_tests.rs");
 
     /// A marker as a pass with the default attribution posts it.

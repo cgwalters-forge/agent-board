@@ -111,6 +111,11 @@ Then come the findings, most important first. In an approving review, list
 important findings and nits under a "Follow-ups" heading, each with its file
 and line, for later pull requests. When there is a blocker, the fix may take
 important findings and nits along.
+When the only blocker is that the pull request's title or body claims what
+the diff does not deliver, so no change to the branch alone can resolve it,
+end the comment with a line of its own starting `PR text blocker: ` and then
+the whole line of the title or body that makes the claim, copied verbatim
+and unquoted. Give no such line with any other blocker.
 Do not include a `Verification:` paragraph.
 Skip praise and style nits a linter would catch.
 This verdict is only text, never a GitHub approval or merge authorization; an
