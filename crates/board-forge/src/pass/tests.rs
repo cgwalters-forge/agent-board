@@ -11247,7 +11247,9 @@ fn answered_verdict_release_rules() {
         ),
     ] {
         for board_triage in [true, false] {
-            let config = outside_harness(config(json!({"triageFollowUpDays": 3})));
+            let config = outside_harness(config(
+                json!({"triageFollowUpDays": 3, "scheduleRestReads": true}),
+            ));
             let mut forge = Forge::new(None, false);
             only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
             if board_triage {
@@ -11313,6 +11315,17 @@ fn answered_verdict_release_rules() {
             if let Some((label, at)) = removal {
                 verdict_removal(&mut forge, label, at);
             }
+            let timeline = format!(
+                "{API_ROOT}repos/cgwalters-forge/tracker/issues/446/timeline?per_page=100&page=1"
+            );
+            let body: Vec<_> = removal.into_iter().map(|(label, at)| {
+                json!({"event":"unlabeled", "label":{"name":label}, "created_at":at})
+            }).collect();
+            forge
+                .replay
+                .requests
+                .push(json!({"request": {"get": timeline},
+                "answer": {"status": 200, "link": null, "body": body}}));
             if plan {
                 let job = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": 446,
                 "kind": "implement", "runner": "hosted", "brief": "Implement the bounded fix."});
@@ -11336,6 +11349,25 @@ fn answered_verdict_release_rules() {
             .unwrap();
             assert_eq!(forge.writes.borrow().len(), before, "{name}");
             assert_eq!(preview.failures, 0, "{name}: {:?}", preview.lines);
+            if released {
+                assert!(
+                    preview
+                        .lines
+                        .iter()
+                        .any(|line| line.starts_with("schedule REST verdict-removals: 1 resolved")),
+                    "{name}: {:?}",
+                    preview.lines
+                );
+                // The applying path must not restore the hold if REST lags
+                // the label removal that live GraphQL can see.
+                let rest = forge
+                    .replay
+                    .requests
+                    .iter_mut()
+                    .find(|entry| entry["request"]["get"] == timeline)
+                    .unwrap();
+                rest["answer"]["body"] = json!([]);
+            }
             let report = apply(&forge, &config);
             assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
             let rule = if released {
@@ -11402,6 +11434,140 @@ fn assignments(replay: &mut Replay, number: u64, events: &[(&str, &str, i64)], a
             "assignments": {"pageInfo": {"hasPreviousPage": events.len() >= 100},
                 "nodes": nodes}}}}}
     }));
+}
+
+#[test]
+fn schedule_rest_assignments_revalidate_and_keep_release_preflight_live() {
+    const REPO: &str = "cgwalters-forge/tracker";
+    assert!(!config(json!({})).schedule_rest_reads);
+    assert!(forgejo::check_options(&json!({"scheduleRestReads": false})).is_err());
+    let config = outside_harness(config(json!({"assignHolds": true,
+        "scheduleRestReads": true, "state": "pass-state.json", "triageFollowUpDays": 3})));
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    assignments(
+        &mut forge.replay,
+        446,
+        &[("AssignedEvent", "cgwalters-bot", 1)],
+        &["cgwalters"],
+    );
+    let url = format!("{API_ROOT}repos/{REPO}/issues/446");
+    let timeline = format!("{url}/timeline?per_page=100&page=1");
+    let comments = format!("{url}/comments?per_page=100&page=1");
+    let at = (forge.replay.now + time::Duration::hours(1))
+        .format(&Rfc3339)
+        .unwrap();
+    let closed = (forge.replay.now + time::Duration::hours(2))
+        .format(&Rfc3339)
+        .unwrap();
+    // GraphQL's subsequent recheck sees no close. The REST look-ahead must
+    // not unassign the operator when the live evidence no longer agrees.
+    for (get, body) in [
+        (&comments, json!([])),
+        (
+            &url,
+            json!({"html_url": format!("https://github.com/{REPO}/issues/446"),
+            "state": "open", "number": 446, "assignees": [{"login": "cgwalters"}]}),
+        ),
+        (
+            &timeline,
+            json!([
+                {"event": "assigned", "created_at": at, "actor": {"login": "cgwalters-bot"},
+                    "assignee": {"login": "cgwalters"}},
+                {"event": "closed", "created_at": closed, "actor": {"login": "cgwalters"}}
+            ]),
+        ),
+    ] {
+        forge.replay.requests.push(json!({"request": {"get": get},
+            "answer": {"status": 200, "link": null, "body": body}}));
+    }
+    let mut fixture = ConditionalRecording {
+        replay: forge,
+        reads: RefCell::default(),
+        traffic: RefCell::default(),
+        contextless: Cell::default(),
+    };
+    let run_pass = |fixture: &ConditionalRecording<Forge>, mode, state| {
+        block(run(
+            fixture,
+            fixture,
+            &config,
+            state,
+            (mode, Limits::default()),
+            fixture.replay.replay.now,
+        ))
+        .unwrap()
+    };
+    let cold = run_pass(&fixture, Mode::Preview, State::default());
+    let warm = run_pass(&fixture, Mode::Preview, cold.state.clone().unwrap());
+    for (report, count) in [(&cold, 0), (&warm, 2)] {
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert!(report.lines.iter().any(|line| line == &format!("schedule REST assignments: 1 resolved by REST, {} charged REST requests, {count} HTTP 304s, 0 GraphQL fallbacks needed", 2 - count)), "{:?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|line| line.contains("it was closed (assigned")),
+            "{:?}",
+            report.lines
+        );
+    }
+    let caller = own();
+    for (name, absent, empty, fallback) in [
+        ("REST sees a close", false, false, 0),
+        ("assignees and timeline disagree", true, false, 1),
+        ("both REST reads precede the assignment", true, true, 0),
+    ] {
+        for entry in &mut fixture.replay.replay.requests {
+            if absent && entry["request"]["get"] == url {
+                entry["answer"]["body"]["assignees"] = json!([]);
+            }
+            if empty && entry["request"]["get"] == timeline {
+                entry["answer"]["body"] = json!([]);
+            }
+        }
+        fixture.reads.borrow_mut().clear();
+        let applied = run_pass(
+            &fixture,
+            Mode::Actions(&caller),
+            cold.state.clone().unwrap(),
+        );
+        assert_eq!(applied.failures, 0, "{name}: {:?}", applied.lines);
+        assert!(
+            applied
+                .lines
+                .iter()
+                .any(|line| line.contains("assigned to cgwalters since")),
+            "{name}: {:?}",
+            applied.lines
+        );
+        assert!(
+            applied
+                .lines
+                .iter()
+                .any(|line| line.starts_with("schedule REST assignments:")
+                    && line.ends_with(&format!("{fallback} GraphQL fallbacks needed"))),
+            "{name}: {:?}",
+            applied.lines
+        );
+        assert!(
+            !fixture
+                .replay
+                .writes
+                .borrow()
+                .iter()
+                .any(|(_, url, _)| url.ends_with("/assignees")),
+            "{name}"
+        );
+        assert!(fixture.replay.dispatches().is_empty(), "{name}");
+        assert!(
+            fixture
+                .reads
+                .borrow()
+                .contains_key(&format!("GraphQL {}", wait::WAIT_QUERY)),
+            "{name}"
+        );
+    }
 }
 
 /// Every issue on the board read in `replay` labelled `label` as well.

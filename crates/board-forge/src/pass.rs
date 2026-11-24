@@ -742,6 +742,9 @@ pub struct Config {
     /// reading assignment history, leaving request headroom for ready work.
     #[serde(default)]
     pub read_free_holds: bool,
+    /// Off by default: schedule look-ahead can revalidate equivalent REST reads.
+    #[serde(default)]
+    pub schedule_rest_reads: bool,
     /// Off by default: stage 4 holds a candidate again without reading it
     /// while the board shows it unchanged since the last pass held it
     /// ([`lean`]).
@@ -3061,6 +3064,7 @@ struct Bounds {
     by_cause: RefCell<BTreeMap<String, usize>>,
     by_operation: RefCell<BTreeMap<String, OperationCounts>>,
     root_reads: RefCell<Option<RootReads>>,
+    schedule_rest: RefCell<BTreeMap<&'static str, schedule_rest::Counts>>,
 }
 
 impl Bounds {
@@ -3108,6 +3112,7 @@ impl Bounds {
             by_cause: RefCell::default(),
             by_operation: RefCell::default(),
             root_reads: RefCell::default(),
+            schedule_rest: RefCell::default(),
         }
     }
 
@@ -5006,6 +5011,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     scheduler.refresh_pull_links();
     // Stage 4b: read-only visibility into approved fork PRs, never publication.
     scheduler.promote();
+    for (operation, counts) in bounds.schedule_rest.borrow().iter() {
+        scheduler.line(format!("schedule REST {operation}: {counts}"));
+    }
     // Stage 5: board Status from the facts read, this pass's starts included.
     // No start comes after stage 4, so it and the holds spend what is left.
     bounds.reserve.set(0);
@@ -8040,6 +8048,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// Whether `item` reads as a pull request; not where it reads as
     /// anything else or not at all.
     fn pull_request(&self, item: &ItemRef) -> bool {
+        self.schedule_rest("issue-kind", |read| read.item(item).map(|item| item.pull))
+            .unwrap_or_else(|| self.pull_request_graphql(item))
+    }
+
+    fn pull_request_graphql(&self, item: &ItemRef) -> bool {
         let Some((owner, name)) = item.repository.split_once('/') else {
             return false;
         };
@@ -9916,11 +9929,26 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         issue: &ItemRef,
         verdict: &plan::Comment,
         comments: &'c [plan::Comment],
+        look_ahead: bool,
     ) -> Result<Option<&'c plan::Comment>> {
         let candidates = self.verdict_answers(verdict, comments);
         if candidates.is_empty() {
             return Ok(None);
         }
+        let rest = look_ahead
+            .then(|| self.schedule_rest("verdict-removals", |read| read.removal(issue)))
+            .flatten();
+        let removed = match rest {
+            Some(removed) => removed,
+            None => self.verdict_removal_graphql(issue)?,
+        };
+        Ok(candidates
+            .into_iter()
+            .filter(|c| removed > Some(c.created))
+            .max_by_key(|c| c.changed))
+    }
+
+    fn verdict_removal_graphql(&self, issue: &ItemRef) -> Result<Option<OffsetDateTime>> {
         let node = self.issue_read(issue, VERDICT_REMOVALS_QUERY)?;
         let events = node["removals"]["nodes"]
             .as_array()
@@ -9936,10 +9964,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let at = OffsetDateTime::parse(at, &Rfc3339).context("label removal time")?;
             removed = removed.max(Some(at));
         }
-        Ok(candidates
-            .into_iter()
-            .filter(|c| removed > Some(c.created))
-            .max_by_key(|c| c.changed))
+        Ok(removed)
     }
 
     /// Writer responses, excluding bookkeeping and plans. A needs-issue
@@ -9992,14 +10017,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         verdict: &plan::Comment,
         comments: &'c [plan::Comment],
     ) -> Result<Option<wait::Response<'c>>> {
+        // Either answer can cause a write: a release can start triage;
+        // no release can put a label or assignment back. Neither may rely on
+        // a REST timeline lagging behind GraphQL in a pass that can write.
+        let look_ahead =
+            !self.apply || (self.caps.full(Kind::Write) && self.caps.full(Kind::Dispatch));
         if self.config.assign_holds {
-            let response = self.assignment_answer(issue, verdict, comments)?;
+            let response = self.assignment_answer(issue, verdict, comments, look_ahead)?;
             if response.is_some() || !self.config.operator_questions_only {
                 return Ok(response);
             }
         }
         Ok(self
-            .verdict_answer(issue, verdict, comments)?
+            .verdict_answer(issue, verdict, comments, look_ahead)?
             .map(wait::Response::Comment))
     }
 
@@ -11145,6 +11175,7 @@ pub mod sessions;
 pub mod starts;
 mod status;
 pub(crate) use living::MARKER as LIVING_STATUS_MARKER;
+mod schedule_rest;
 pub mod sweep;
 mod today;
 mod upstreams;
