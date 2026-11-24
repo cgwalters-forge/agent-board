@@ -4152,10 +4152,18 @@ does). It reads the pull request again just before its first write, and then
 checks `pr.ownerBranches` and the same fail-closed associated-PR guard as
 stage 2: every open PR sharing the head must be in a followed repository.
 It charges the next stage 2 fix round in our own space. For upstream work,
-the ledger is the unique same-head midstream PR (including one closed by
-promotion), verified as the bot's and not frozen. Both repositories must be
-followed. With `fixPlans`, stage 2 leaves upstream PRs read-only but the
-bot's own with no same-head midstream PR, on which it takes the bot's own
+the ledger is the unique same-branch midstream PR (including one closed by
+promotion), verified as the bot's, on the same branch of the same repository,
+and labelled neither `hold` nor `needs-human`. An open one must also be at the
+upstream PR's head; a closed or merged one keeps the head it was closed at, so
+the upstream head moving after promotion does not hold the plan. A closed
+ledger is thus bound to the upstream PR by branch, repository, uniqueness,
+the bot's authorship of the pull request and its labels, not by who wrote
+the commits now on that branch, as stage 2's rounds on the bot's own pull
+requests are. Its hold says which of these failed (`its midstream round
+ledger OWNER/REPO#N is labelled hold`). Both repositories must
+be followed. With `fixPlans`, stage 2 leaves upstream PRs read-only but the
+bot's own with no same-branch midstream PR, on which it takes the bot's own
 rounds directly ([the poll](poll.md)); a plan's pull request always has one,
 so the two never start on the same pull request. Its midstream
 rounds and planned fixes share that ledger's `pr.fixRounds` (2 by default). Missing or
@@ -6377,7 +6385,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `reserveOperator` | GitHub only: every triage brief states the `operatorAsk` bar for `needs-operator`, a `needs-design` verdict is planned rather than asked, and with `assignHolds` a verdict whose assignment the bot took off is triaged again rather than assigned again, see [reserving the operator](#reserving-the-operator); needs `triageFollowUpDays` and `operatorAsk`; `false` |
 | `replanInvalid` | GitHub only: request one replacement of an invalid bot-written job plan or unparseable epic plan before asking the operator; existing holds and start caps remain; `false` |
 | `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |
-| `fixPlans` | GitHub only: ask follow-through on promoted work for a fix plan on its upstream pull request, and start accepted fix plans on the bot's open pull requests within `--fix-bounds`, see [scheduling](#scheduling). Stage 2 then takes no step outside our own space but the bot's own rounds on a pull request it authored there with no same-head midstream pull request, see [the poll](poll.md); `false` |
+| `fixPlans` | GitHub only: ask follow-through on promoted work for a fix plan on its upstream pull request, and start accepted fix plans on the bot's open pull requests within `--fix-bounds`, see [scheduling](#scheduling). Stage 2 then takes no step outside our own space but the bot's own rounds on a pull request it authored there with no same-branch midstream pull request, see [the poll](poll.md); `false` |
 | `sessionPlans` | GitHub only: start the operator's own accepted [session](sessions.md) plans on their own issue under existing pacing and caps, as `researchPlans` starts research plans; the planner's session plans wait on the operator; `false` |
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |

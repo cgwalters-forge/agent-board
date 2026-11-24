@@ -11,6 +11,14 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- A fix plan for a promoted pull request whose head moved after promotion
+  now starts. Its round ledger, the midstream pull request promotion closed,
+  keeps the head it was closed at, and the pass had held every such plan
+  for good (`its midstream round ledger is unreadable, frozen, or not the
+  same bot head`); only an open ledger must now be at the head. That hold
+  now says which check failed, such as `its midstream round ledger
+  OWNER/REPO#N is labelled hold`.
+
 - The pass's new `trackingRepo` (`dispatchRepo` unless set) names the host
   for tracking issues and `midstream` direction staged when a fork has no
   issues. Dispatch can move within the same owner while tracking receipts

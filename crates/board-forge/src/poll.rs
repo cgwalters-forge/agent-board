@@ -858,7 +858,7 @@ pub struct PollPolicy {
     /// fix-kind run on it ([`bounds`]); none (the default) checks nothing.
     pub fix_bounds: bounds::FixBoundsSet,
     /// The pass's `fixPlans`: upstream branch fixes are planned on the tracker
-    /// and accounted on their same-head midstream PR, never by upstream writes,
+    /// and accounted on their same-branch midstream PR, never by upstream writes,
     /// but for the bot's own [`AUTHORED_STEPS`] on a pull request it authored
     /// upstream with no midstream PR ([`Config::held_in`]).
     pub fix_plans: bool,
@@ -2601,7 +2601,7 @@ fn nodes<'a>(value: &'a Value, pointer: &str) -> &'a [Value] {
         .unwrap_or_default()
 }
 
-fn short(sha: &str) -> &str {
+pub(crate) fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 
@@ -11592,7 +11592,7 @@ fn read_direction<R: Rest, G: Transport>(
 }
 
 /// Reuse stage 2's push preflights, then locate the authorized round ledger.
-/// Upstream plans need exactly one same-head PR in the head repository,
+/// Upstream plans need exactly one same-branch PR in the head repository,
 /// in our space and followed by stage 2. Legacy upstream accounting is held
 /// for a human rather than silently resetting its allowance during migration.
 pub(crate) fn planned_fix_control<R: Rest, G: Transport>(
@@ -11639,7 +11639,7 @@ pub(crate) fn planned_fix_control<R: Rest, G: Transport>(
     // these ([`Pass::planned_upstream`]), so the two never share one.
     let [(_, control_number)] = pass.midstream_pulls(repo, number, pull)?[..] else {
         return Err(
-            "it needs exactly one same-head midstream pull request for round accounting".into(),
+            "it needs exactly one same-branch midstream pull request for round accounting".into(),
         );
     };
     if !pass.followed.contains(&head_repo.to_ascii_lowercase()) {

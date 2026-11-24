@@ -18816,9 +18816,27 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         ("shared heads truncated", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
             held("more than the 20 pull requests read share its head")),
         ("no midstream ledger", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
-            held("it needs exactly one same-head midstream pull request for round accounting")),
-        ("frozen midstream ledger", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
-            held("its midstream round ledger is unreadable, frozen, or not the same bot head")),
+            held("it needs exactly one same-branch midstream pull request for round accounting")),
+        ("a held midstream ledger", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held(&format!("its midstream round ledger {CONTROL}#70 is labelled hold"))),
+        ("a needs-human midstream ledger", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held(&format!("its midstream round ledger {CONTROL}#70 is labelled needs-human"))),
+        ("two midstream ledgers", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held("it needs exactly one same-branch midstream pull request for round accounting")),
+        // Promotion closed it at the head it then had, which the upstream
+        // pull request has since moved past.
+        ("a ledger closed behind the head", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 1), start.clone()),
+        ("a ledger merged behind the head", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 1), start.clone()),
+        ("an open ledger behind the head", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held(&format!("its midstream round ledger {CONTROL}#70 is open at 222222222222, not at the pull request's head 111111111111"))),
+        ("a ledger on another branch", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held(&format!("its midstream round ledger {CONTROL}#70 has head {CONTROL}:bot/other, not {CONTROL}:bot/rebase-erofs"))),
+        ("a ledger not the bot's", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held(&format!("its midstream round ledger {CONTROL}#70 is not cgwalters-bot's pull request from a head it may push to"))),
+        ("a ledger's labels unread", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held(&format!("its midstream round ledger {CONTROL}#70 has labels that could not all be read"))),
+        ("an unread ledger", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held(&format!("its midstream round ledger {CONTROL}#70 could not be read"))),
         ("legacy upstream accounting", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
             held("its upstream round accounting needs operator migration to the midstream pull request")),
         ("ownerBranches missing", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
@@ -18893,6 +18911,8 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
             "shared heads unread" => shared = Value::Null,
             "shared heads truncated" => shared["repository"]["pullRequest"]["headRef"]["associatedPullRequests"]["pageInfo"]["hasNextPage"] = true.into(),
             "no midstream ledger" => { shared["repository"]["pullRequest"]["headRef"]["associatedPullRequests"]["nodes"].as_array_mut().unwrap().pop(); },
+            "two midstream ledgers" => shared["repository"]["pullRequest"]["headRef"]["associatedPullRequests"]["nodes"].as_array_mut().unwrap()
+                .push(json!({"number": 71, "repository": {"nameWithOwner": CONTROL}})),
             _ => {},
         }
         forge.replay.requests.push(json!({"request": graphql_key(poll::SHARED_HEAD_QUERY,
@@ -18904,8 +18924,30 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         let mut control_pull = pull.clone();
         control_pull["isCrossRepository"] = false.into();
         control_pull["state"] = "CLOSED".into();
-        if name == "frozen midstream ledger" {
-            control_pull["labels"]["nodes"] = json!([{"name": "hold"}]);
+        let behind = "2222222222222222222222222222222222222222";
+        match name {
+            "a held midstream ledger" => {
+                control_pull["labels"]["nodes"] = json!([{"name": "hold"}])
+            }
+            "a ledger closed behind the head" => control_pull["headRefOid"] = behind.into(),
+            "a needs-human midstream ledger" => {
+                control_pull["labels"]["nodes"] = json!([{"name": "needs-human"}])
+            }
+            "a ledger merged behind the head" => {
+                control_pull["state"] = "MERGED".into();
+                control_pull["headRefOid"] = behind.into();
+            }
+            "an open ledger behind the head" => {
+                control_pull["state"] = "OPEN".into();
+                control_pull["headRefOid"] = behind.into();
+            }
+            "a ledger on another branch" => control_pull["headRefName"] = "bot/other".into(),
+            "a ledger not the bot's" => control_pull["author"]["login"] = "visitor".into(),
+            "a ledger's labels unread" => {
+                control_pull["labels"]["pageInfo"]["hasNextPage"] = true.into()
+            }
+            "an unread ledger" => control_pull = Value::Null,
+            _ => {}
         }
         forge
             .replay
