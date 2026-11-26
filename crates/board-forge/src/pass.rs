@@ -2819,6 +2819,62 @@ fn fix_in_flight(dest: &ItemRef, busy: &BTreeMap<String, String>) -> Option<Hold
     })
 }
 
+/// Why `midstream`, read as the midstream pull request in `control` that
+/// [`poll::planned_fix_control`] found sharing `pull`'s head branch, cannot
+/// be `pull`'s round ledger: unread, not the bot's, another branch, behind
+/// while open, or held. Promotion closes it, and a closed or merged pull
+/// request's head stays where it was then, so only an open one must be at
+/// `pull`'s head: a closed one would otherwise refuse every fix once the
+/// upstream head moved. Its round accounting is keyed by `pull`'s head
+/// ([`poll::planned_fix_hold`]), not by its own.
+fn ledger_refusal(
+    midstream: &Value,
+    pull: &Value,
+    control: &str,
+    config: &poll::Config,
+) -> Option<String> {
+    let state = text(midstream, "/state");
+    if !matches!(state, "OPEN" | "CLOSED" | "MERGED") {
+        return Some("could not be read".into());
+    }
+    let labels = midstream.pointer("/labels/nodes").and_then(Value::as_array);
+    let (Some(labels), Some(false)) = (
+        labels,
+        midstream["labels"]["pageInfo"]["hasNextPage"].as_bool(),
+    ) else {
+        return Some("has labels that could not all be read".into());
+    };
+    if !poll::is_harness(midstream, config) {
+        return Some(format!(
+            "is not {}'s pull request from a head it may push to",
+            config.bot
+        ));
+    }
+    let head_repo = text(midstream, "/headRepository/nameWithOwner");
+    let (branch, want) = (text(midstream, "/headRefName"), text(pull, "/headRefName"));
+    if head_repo != control || branch != want {
+        return Some(format!(
+            "has head {head_repo}:{branch}, not {control}:{want}"
+        ));
+    }
+    let (at, head) = (text(midstream, "/headRefOid"), text(pull, "/headRefOid"));
+    if state == "OPEN" && at != head {
+        return Some(format!(
+            "is open at {}, not at the pull request's head {}",
+            poll::short(at),
+            poll::short(head)
+        ));
+    }
+    labels
+        .iter()
+        .find_map(|l| {
+            [poll::HOLD_LABEL, NEEDS_HUMAN]
+                .into_iter()
+                .find(|name| text(l, "/name").eq_ignore_ascii_case(name))
+        })
+        .map(|label| format!("is labelled {label}"))
+}
+
 /// A merged Part of slice must not unstack past the next slice's run,
 /// which may not have opened its pull request yet.
 fn stack_hold(dest: &ItemRef, lower: Option<u64>, busy: &BTreeMap<String, String>) -> Option<Hold> {
@@ -8371,26 +8427,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     ))
                 })?;
             let midstream = &data["repository"]["pullRequest"];
-            let labels = midstream.pointer("/labels/nodes").and_then(Value::as_array);
-            if !matches!(text(midstream, "/state"), "OPEN" | "CLOSED" | "MERGED")
-                || !poll::is_harness(midstream, &poll)
-                || text(midstream, "/headRefOid") != text(&pull, "/headRefOid")
-                || text(midstream, "/headRefName") != branch
-                || text(midstream, "/headRepository/nameWithOwner") != control.repository
-                || labels.is_none()
-                || midstream["labels"]["pageInfo"]["hasNextPage"] != false
-                || labels.is_some_and(|ls| {
-                    ls.iter().any(|l| {
-                        [poll::HOLD_LABEL, NEEDS_HUMAN]
-                            .iter()
-                            .any(|name| text(l, "/name").eq_ignore_ascii_case(name))
-                    })
-                })
-            {
-                return Err(held(
-                    "its midstream round ledger is unreadable, frozen, or not the same bot head"
-                        .into(),
-                ));
+            if let Some(why) = ledger_refusal(midstream, &pull, &control.repository, &poll) {
+                return Err(held(format!(
+                    "its midstream round ledger {} {why}",
+                    control.display()
+                )));
             }
         }
         match text(&pull, "/headRefOid") {
