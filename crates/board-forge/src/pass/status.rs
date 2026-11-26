@@ -10,7 +10,6 @@
 //! goes back to Todo, but only where the absence of work is known: an item
 //! whose facts were not read whole keeps its Status.
 use super::*;
-use crate::Forge;
 use crate::github::{GitHub, field_writes};
 use board_core::{Item, Status, StatusRules, StatusSignals, derive_status};
 
@@ -193,11 +192,15 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
         // A snapshot is all-or-nothing. Its size is only known while reading;
         // if admission stops mid-read, discard it before deriving or writing
         // anything. Forge/decoding errors remain errors, not budget deferrals.
-        let snapshot = match github.snapshot().await {
+        let (snapshot, membership_complete) = match github.snapshot_and_membership_coverage().await
+        {
             Ok(snapshot) => snapshot,
             Err(error) if self.read_deferred(&error) => return Ok(()),
             Err(error) => return Err(error.context("reading the whole board")),
         };
+        if config.project_membership_audit && membership_complete {
+            self.audit_membership = membership_audit::Membership::from_snapshot(board, &snapshot);
+        }
         // What scheduling read is reused, and what it failed to read, which
         // it reported, is not read again; what it did not reach is read here.
         let runs = "the runs in flight could not be listed";

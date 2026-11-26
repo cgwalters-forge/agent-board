@@ -1727,9 +1727,9 @@ impl<T: GraphQl> Forge for GitHub<T> {
     }
 
     async fn snapshot(&self) -> Result<Snapshot> {
-        let policy = board_core::AgentPolicy::parse(board_core::DEFAULT_AGENT_POLICY)?;
-        self.snapshot_with_policy(&policy, SNAPSHOT_REQUEST_LIMIT)
+        self.snapshot_and_membership_coverage()
             .await
+            .map(|(snapshot, _)| snapshot)
     }
 }
 
@@ -2215,6 +2215,14 @@ impl<T> GitHub<T> {
 }
 
 impl<T: GraphQl> GitHub<T> {
+    /// The ordinary Status snapshot and, separately, whether its items cover
+    /// issue membership. A known draft or an incomplete field does not hide
+    /// a repository issue, but unreadable content or item pages might.
+    pub(crate) async fn snapshot_and_membership_coverage(&self) -> Result<(Snapshot, bool)> {
+        let policy = board_core::AgentPolicy::parse(board_core::DEFAULT_AGENT_POLICY)?;
+        self.read_snapshot(&policy, SNAPSHOT_REQUEST_LIMIT).await
+    }
+
     /// The whole board in at most `budget` requests: running out is an
     /// error, never a partial snapshot. [`SNAPSHOT_REQUEST_LIMIT`] is the
     /// default.
@@ -2223,6 +2231,16 @@ impl<T: GraphQl> GitHub<T> {
         policy: &board_core::AgentPolicy,
         budget: usize,
     ) -> Result<Snapshot> {
+        self.read_snapshot(policy, budget)
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    async fn read_snapshot(
+        &self,
+        policy: &board_core::AgentPolicy,
+        budget: usize,
+    ) -> Result<(Snapshot, bool)> {
         ensure!(self.number > 0, "project number must be positive");
         let diagnostic = self.diagnostic();
         let transport = ReadBudget::new(&diagnostic, budget);
@@ -2239,12 +2257,14 @@ impl<T: GraphQl> GitHub<T> {
         )
         .await?;
         complete &= members_complete;
+        let mut membership_complete = members_complete;
         let mut items = Vec::new();
         for member in members {
             let content = &member["content"];
             let kind = content["__typename"].as_str();
             if !matches!(kind, Some("Issue" | "PullRequest")) {
                 complete = false;
+                membership_complete &= kind == Some("DraftIssue");
                 continue;
             }
             let content_id = text(content, "id")?;
@@ -2443,7 +2463,7 @@ impl<T: GraphQl> GitHub<T> {
         validate_github_project(&snapshot.project)?;
         snapshot.validate()?;
         policy.normalize(&mut snapshot)?;
-        Ok(snapshot)
+        Ok((snapshot, membership_complete))
     }
 }
 
